@@ -1,6 +1,6 @@
 import time
 from typing import Dict, Any, List
-
+import re
 import requests
 from bs4 import BeautifulSoup
 
@@ -26,19 +26,19 @@ async def solve_single_quiz(
     html, text = await fetch_page_html_and_text(quiz_url)
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Extract question text
-    possible: List[str] = []
+    # ---------- Extract question ----------
+    possible = []
     for elem in soup.find_all(text=True):
         t = elem.strip()
-        if t and (t.startswith("Q") or "Question" in t):
+        if t and (t.lower().startswith("q") or "question" in t.lower()):
             possible.append(t)
 
-    question_text = "\n".join(possible) if possible else text
+    question_text = "\n".join(possible) if possible else text.strip()
 
-    # 2. Load downloadable data
+    # ---------- Load downloadable data ----------
     download_links = find_download_links_from_html(html)
-    dataframes: List[Dict[str, Any]] = []
-    data_context_parts: List[str] = []
+    dataframes = []
+    data_context_parts = []
 
     for link in download_links:
         try:
@@ -47,88 +47,65 @@ async def solve_single_quiz(
             data_context_parts.append(meta)
             dataframes.append({"url": full_link, "df": df})
         except Exception as e:
-            data_context_parts.append(f"Failed to load data from {link}: {e}")
+            data_context_parts.append(f"Failed to load {link}: {str(e)}")
 
     data_context_text = "\n\n".join(data_context_parts)
 
-    # 3. Classify question type
+    # ---------- Determine question type ----------
     question_type = classify_question_type(question_text)
 
     answer_value = None
     llm_info = {}
 
-    # 4. Strategy routing
-    if question_type == "numeric":
-        # Attempt numeric computation
-        if dataframes:
-            col_name = extract_column_sum_from_question(question_text)
-            if col_name:
-                for item in dataframes:
-                    df = item["df"]
-                    df_cols_lower = {c.lower(): c for c in df.columns}
-                    if col_name.lower() in df_cols_lower:
-                        real_col = df_cols_lower[col_name.lower()]
-                        try:
-                            s = df[real_col].sum()
-                            answer_value = float(s) if hasattr(s, "item") else s
-                            llm_info = {"mode": "numeric_auto"}
-                            break
-                        except Exception:
-                            pass
+    # ---------- Strategy Selector ----------
+    if question_type == "numeric" and dataframes:
+        col_name = extract_column_sum_from_question(question_text)
+        if col_name:
+            for item in dataframes:
+                df = item["df"]
+                col_map = {c.lower(): c for c in df.columns}
+                if col_name.lower() in col_map:
+                    try:
+                        real_col = col_map[col_name.lower()]
+                        s = df[real_col].sum()
+                        answer_value = float(s) if hasattr(s, "item") else s
+                        llm_info = {"mode": "numeric_auto"}
+                        break
+                    except:
+                        pass
 
-        # Fallback: let LLM interpret numeric question
-        if answer_value is None:
-            llm_result = await ask_llm_for_answer(
-                question_text=question_text,
-                context_text=text,
-                data_notes=data_context_text,
-            )
-            answer_value = llm_result.get("answer")
-            llm_info = {"mode": "numeric_llm_fallback", "llm_raw": llm_result}
-
-    elif question_type == "text":
-        llm_result = await ask_llm_for_answer(
-            question_text=question_text,
-            context_text=text,
-            data_notes=data_context_text,
-        )
-        answer_value = llm_result.get("answer")
-        llm_info = {"mode": "text_llm", "llm_raw": llm_result}
-
-    else:
-        # General reasoning category
-        llm_result = await ask_llm_for_answer(
-            question_text=question_text,
-            context_text=text,
-            data_notes=data_context_text,
-        )
-        answer_value = llm_result.get("answer")
-        llm_info = {"mode": "general_llm", "llm_raw": llm_result}
-
-    # 5. Hard safety fallback
+    # ---------- LLM fallback ----------
     if answer_value is None:
-        import re
-        combined = question_text + "\n" + text + "\n" + data_context_text
-        m = re.search(r"-?\d+(\.\d+)?", combined)
-        if m:
-            answer_value = float(m.group())
+        llm_result = await ask_llm_for_answer(
+            question_text=question_text,
+            context_text=text,
+            data_notes=data_context_text,
+        )
+
+        answer_value = llm_result.get("answer")
+        llm_info = {"mode": "llm_reasoned", "llm_raw": llm_result}
+
+    # ---------- Absolute Safety Net ----------
+    if answer_value is None:
+        detected = re.search(r"-?\d+(\.\d+)?", question_text)
+        if detected:
+            answer_value = float(detected.group())
         else:
             answer_value = "unknown"
 
-    # 6. Find submit URL
+    # ---------- Find submit URL ----------
     submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
 
     if submit_url is None:
         return {
             "correct": False,
-            "error": "Could not find submit URL",
+            "error": "Submit URL not found",
             "url": None,
             "submit_url": None,
             "used_answer": answer_value,
             "llm_info": llm_info,
         }
 
-    # 7. Submit answer
     payload = {
         "email": email,
         "secret": secret,
@@ -143,7 +120,7 @@ async def solve_single_quiz(
     except Exception as e:
         return {
             "correct": False,
-            "error": f"Submit failed: {e}",
+            "error": f"Submission failed: {str(e)}",
             "url": None,
             "submit_url": submit_url,
             "used_answer": answer_value,
@@ -170,7 +147,7 @@ async def solve_quiz(
 ) -> Dict[str, Any]:
 
     current_url = start_url
-    history: List[Dict[str, Any]] = []
+    history = []
 
     while True:
         elapsed = time.time() - start_time
@@ -205,3 +182,4 @@ async def solve_quiz(
             continue
 
         return {"status": "finished_correct", "history": history}
+
