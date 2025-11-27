@@ -12,6 +12,7 @@ from .utils import (
     normalize_url,
     download_and_load_data,
     extract_column_sum_from_question,
+    classify_question_type,
 )
 
 
@@ -50,51 +51,71 @@ async def solve_single_quiz(
 
     data_context_text = "\n\n".join(data_context_parts)
 
-    # 3. HARD LOGIC FIRST : solve sum questions without LLM
-    numeric_answer = None
+    # 3. Classify question type
+    question_type = classify_question_type(question_text)
 
-    if dataframes and "sum" in question_text.lower():
-        col_name = extract_column_sum_from_question(question_text)
-        if col_name:
-            for item in dataframes:
-                df = item["df"]
-                df_cols_lower = {c.lower(): c for c in df.columns}
-                if col_name.lower() in df_cols_lower:
-                    real_col = df_cols_lower[col_name.lower()]
-                    try:
-                        s = df[real_col].sum()
-                        numeric_answer = float(s) if hasattr(s, "item") else s
-                        break
-                    except Exception:
-                        pass
+    answer_value = None
+    llm_info = {}
 
-    # 4. Choose answer source
-    if numeric_answer is not None:
-        answer_value = numeric_answer
-        llm_info = {"used_llm": False}
+    # 4. Strategy routing
+    if question_type == "numeric":
+        # Attempt numeric computation
+        if dataframes:
+            col_name = extract_column_sum_from_question(question_text)
+            if col_name:
+                for item in dataframes:
+                    df = item["df"]
+                    df_cols_lower = {c.lower(): c for c in df.columns}
+                    if col_name.lower() in df_cols_lower:
+                        real_col = df_cols_lower[col_name.lower()]
+                        try:
+                            s = df[real_col].sum()
+                            answer_value = float(s) if hasattr(s, "item") else s
+                            llm_info = {"mode": "numeric_auto"}
+                            break
+                        except Exception:
+                            pass
 
-    else:
+        # Fallback: let LLM interpret numeric question
+        if answer_value is None:
+            llm_result = await ask_llm_for_answer(
+                question_text=question_text,
+                context_text=text,
+                data_notes=data_context_text,
+            )
+            answer_value = llm_result.get("answer")
+            llm_info = {"mode": "numeric_llm_fallback", "llm_raw": llm_result}
+
+    elif question_type == "text":
         llm_result = await ask_llm_for_answer(
             question_text=question_text,
             context_text=text,
             data_notes=data_context_text,
         )
-
         answer_value = llm_result.get("answer")
+        llm_info = {"mode": "text_llm", "llm_raw": llm_result}
 
-        # SAFETY FALLBACK: never respond with None or "unknown"
-        if answer_value is None:
-            import re
-            combined = question_text + "\n" + text + "\n" + data_context_text
-            m = re.search(r"-?\d+(\.\d+)?", combined)
-            if m:
-                answer_value = float(m.group())
-            else:
-                answer_value = 0
+    else:
+        # General reasoning category
+        llm_result = await ask_llm_for_answer(
+            question_text=question_text,
+            context_text=text,
+            data_notes=data_context_text,
+        )
+        answer_value = llm_result.get("answer")
+        llm_info = {"mode": "general_llm", "llm_raw": llm_result}
 
-        llm_info = {"used_llm": True, "llm_raw": llm_result}
+    # 5. Hard safety fallback
+    if answer_value is None:
+        import re
+        combined = question_text + "\n" + text + "\n" + data_context_text
+        m = re.search(r"-?\d+(\.\d+)?", combined)
+        if m:
+            answer_value = float(m.group())
+        else:
+            answer_value = "unknown"
 
-    # 5. Find submit URL
+    # 6. Find submit URL
     submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
 
     if submit_url is None:
@@ -107,7 +128,7 @@ async def solve_single_quiz(
             "llm_info": llm_info,
         }
 
-    # 6. Submit answer
+    # 7. Submit answer
     payload = {
         "email": email,
         "secret": secret,
@@ -170,6 +191,7 @@ async def solve_quiz(
             "correct": result.get("correct"),
             "used_answer": result.get("used_answer"),
             "reason": result.get("reason"),
+            "llm_info": result.get("llm_info"),
         })
 
         if not result.get("correct"):
