@@ -94,6 +94,33 @@ def extract_column_sum_from_question(question: str) -> Optional[str]:
     m2 = re.search(r"sum of the ([a-zA-Z0-9_]+) column", q)
     if m2:
         return m2.group(1)
+        
+def classify_question_type(question: str) -> str:
+    q = question.lower()
+
+    numeric_keywords = [
+        "sum", "total", "count", "average",
+        "mean", "median", "percentage",
+        "difference", "ratio", "how many"
+    ]
+
+    text_keywords = [
+        "explain", "describe", "define",
+        "why", "how does", "interpret"
+    ]
+
+    for word in numeric_keywords:
+        if word in q:
+            return "numeric"
+
+    for word in text_keywords:
+        if word in q:
+            return "text"
+
+    # default fallback
+    return "llm"
+
+
 def extract_column_sum_from_question(question: str):
     """
     Detect column name for sum queries.
@@ -104,3 +131,4 @@ def extract_column_sum_from_question(question: str):
     if match:
         return match.group(1)
     return None
+
