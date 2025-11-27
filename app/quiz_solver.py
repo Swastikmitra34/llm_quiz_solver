@@ -25,7 +25,7 @@ async def solve_single_quiz(
     html, text = await fetch_page_html_and_text(quiz_url)
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Extract question
+    # 1. Extract question text
     possible: List[str] = []
     for elem in soup.find_all(text=True):
         t = elem.strip()
@@ -34,10 +34,10 @@ async def solve_single_quiz(
 
     question_text = "\n".join(possible) if possible else text
 
-    # 2. Load data files
+    # 2. Load downloadable data
     download_links = find_download_links_from_html(html)
-    data_context_parts: List[str] = []
     dataframes: List[Dict[str, Any]] = []
+    data_context_parts: List[str] = []
 
     for link in download_links:
         try:
@@ -50,10 +50,10 @@ async def solve_single_quiz(
 
     data_context_text = "\n\n".join(data_context_parts)
 
-    # 3. Try direct numeric logic first
+    # 3. HARD LOGIC FIRST : solve sum questions without LLM
     numeric_answer = None
 
-    if dataframes:
+    if dataframes and "sum" in question_text.lower():
         col_name = extract_column_sum_from_question(question_text)
         if col_name:
             for item in dataframes:
@@ -68,10 +68,11 @@ async def solve_single_quiz(
                     except Exception:
                         pass
 
-    # 4. Decide how to answer
+    # 4. Choose answer source
     if numeric_answer is not None:
         answer_value = numeric_answer
         llm_info = {"used_llm": False}
+
     else:
         llm_result = await ask_llm_for_answer(
             question_text=question_text,
@@ -79,11 +80,9 @@ async def solve_single_quiz(
             data_notes=data_context_text,
         )
 
-        print("LLM DEBUG >>>", llm_result)
-
         answer_value = llm_result.get("answer")
 
-        # HARD FAIL-SAFE: never allow None
+        # SAFETY FALLBACK: never respond with None or "unknown"
         if answer_value is None:
             import re
             combined = question_text + "\n" + text + "\n" + data_context_text
@@ -91,7 +90,7 @@ async def solve_single_quiz(
             if m:
                 answer_value = float(m.group())
             else:
-                answer_value = "unknown"
+                answer_value = 0
 
         llm_info = {"used_llm": True, "llm_raw": llm_result}
 
@@ -108,7 +107,7 @@ async def solve_single_quiz(
             "llm_info": llm_info,
         }
 
-    # 6. Submit result
+    # 6. Submit answer
     payload = {
         "email": email,
         "secret": secret,
@@ -130,14 +129,10 @@ async def solve_single_quiz(
             "llm_info": llm_info,
         }
 
-    correct = bool(data.get("correct", False))
-    next_url = data.get("url")
-    reason = data.get("reason")
-
     return {
-        "correct": correct,
-        "url": next_url,
-        "reason": reason,
+        "correct": bool(data.get("correct", False)),
+        "url": data.get("url"),
+        "reason": data.get("reason"),
         "raw_response": data,
         "used_answer": answer_value,
         "submit_url": submit_url,
@@ -159,6 +154,7 @@ async def solve_quiz(
     while True:
         elapsed = time.time() - start_time
         remaining = timeout_seconds - elapsed
+
         if remaining <= 0:
             return {"status": "timeout", "history": history}
 
@@ -172,10 +168,8 @@ async def solve_quiz(
         history.append({
             "url": current_url,
             "correct": result.get("correct"),
-            "reason": result.get("reason"),
-            "submit_url": result.get("submit_url"),
             "used_answer": result.get("used_answer"),
-            "llm_info": result.get("llm_info"),
+            "reason": result.get("reason"),
         })
 
         if not result.get("correct"):
