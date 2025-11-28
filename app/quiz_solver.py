@@ -15,11 +15,39 @@ from .utils import (
 )
 
 
+def decode_base64_in_html(html: str) -> str:
+    """
+    Decode base64 strings found in the HTML.
+    Looks for atob() calls and decodes them.
+    """
+    decoded_parts = []
+    
+    # Find all atob() calls with base64 content
+    atob_pattern = r'atob\([\'"`]([A-Za-z0-9+/=]+)[\'"`]\)'
+    matches = re.findall(atob_pattern, html)
+    
+    for base64_str in matches:
+        try:
+            decoded = base64.b64decode(base64_str).decode('utf-8')
+            decoded_parts.append(decoded)
+        except:
+            continue
+    
+    return '\n'.join(decoded_parts)
+
+
 def find_submit_url_from_content(text: str, html: str = "") -> Optional[str]:
     """
     Enhanced submit URL finder with multiple extraction strategies.
     Extracts the submit URL from question text or HTML content.
     """
+    # FIRST: Try to decode any base64 content in the HTML
+    if html:
+        decoded_content = decode_base64_in_html(html)
+        if decoded_content:
+            # Search in the decoded content first
+            text = text + "\n" + decoded_content
+    
     # Strategy 1: Look for explicit "submit" or "post" mentions with URLs
     patterns = [
         r'[Pp]ost\s+(?:your\s+answer\s+)?to\s+(https?://[^\s<>"\']+)',
@@ -102,6 +130,12 @@ async def solve_single_quiz(
     # ======================================================
     html, text = await fetch_page_html_and_text(quiz_url)
     soup = BeautifulSoup(html, "html.parser")
+    
+    # Decode any base64 content in the page
+    decoded_content = decode_base64_in_html(html)
+    if decoded_content:
+        text = text + "\n\n" + decoded_content
+    
     question_text = text.strip()
 
     answer_value = None
@@ -114,7 +148,7 @@ async def solve_single_quiz(
     # Extract all URLs (links to scrape, APIs, data files)
     all_urls = set()
     
-    # From text content
+    # From text content (including decoded content)
     all_urls.update(re.findall(r"https?://[^\s\"'<>]+", text))
     
     # From HTML links
@@ -143,6 +177,17 @@ async def solve_single_quiz(
     
     # Extract submit URL (CRITICAL: never hardcode!)
     submit_url = find_submit_url_from_content(text, html)
+    
+    # If still no submit URL, try to infer from the quiz URL
+    if not submit_url:
+        # Common pattern: quiz domain + /submit
+        parsed_quiz_url = quiz_url.split('?')[0]  # Remove query params
+        base_domain = '/'.join(parsed_quiz_url.split('/')[:3])
+        potential_submit_url = f"{base_domain}/submit"
+        
+        # Verify this URL exists in the page content
+        if potential_submit_url in text or '/submit' in text:
+            submit_url = potential_submit_url
     
     # Separate URLs by type
     current_page_url = quiz_url
@@ -193,6 +238,12 @@ Respond with:
         for url in other_urls:
             try:
                 sub_html, sub_text = await fetch_page_html_and_text(url)
+                
+                # Also decode any base64 in the scraped page
+                decoded_sub = decode_base64_in_html(sub_html)
+                if decoded_sub:
+                    sub_text = sub_text + "\n\n" + decoded_sub
+                
                 scraped_data.append({
                     "url": url,
                     "html": sub_html,
@@ -208,6 +259,7 @@ Respond with:
                             rf"{re.escape(term)}[^\w]*[:\-=]?\s*([^\s<>\"']+)",
                             rf"{re.escape(term)}[^\w]*is[^\w]*([^\s<>\"']+)",
                             rf"<[^>]*{re.escape(term)}[^>]*>([^<]+)</",
+                            rf"{re.escape(term)}[:\s]+([A-Za-z0-9_-]+)",
                         ]
                         
                         for pattern in patterns:
@@ -444,6 +496,7 @@ IMPORTANT INSTRUCTIONS:
             "debug_info": {
                 "question_preview": question_text[:500],
                 "html_preview": html[:500] if html else None,
+                "decoded_content_preview": decoded_content[:500] if decoded_content else None,
             }
         }
     
