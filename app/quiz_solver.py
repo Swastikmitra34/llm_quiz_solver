@@ -35,6 +35,10 @@ async def solve_single_quiz(
 
     question_text = "\n".join(possible) if possible else text.strip()
 
+    print("\n================ QUIZ DEBUG ================")
+    print("QUIZ URL:", quiz_url)
+    print("EXTRACTED QUESTION:\n", question_text)
+
     # ---------- Load downloadable data ----------
     download_links = find_download_links_from_html(html)
     dataframes = []
@@ -51,8 +55,12 @@ async def solve_single_quiz(
 
     data_context_text = "\n\n".join(data_context_parts)
 
+    print("\n---- DATA CONTEXT ----")
+    print(data_context_text if data_context_text else "No external data detected.")
+
     # ---------- Determine question type ----------
     question_type = classify_question_type(question_text)
+    print("\nDetected question type:", question_type)
 
     answer_value = None
     llm_info = {}
@@ -70,28 +78,40 @@ async def solve_single_quiz(
                         s = df[real_col].sum()
                         answer_value = float(s) if hasattr(s, "item") else s
                         llm_info = {"mode": "numeric_auto"}
+                        print("Numeric auto-solved answer:", answer_value)
                         break
-                    except:
-                        pass
+                    except Exception as e:
+                        print("Numeric auto-failed:", e)
 
-    # ---------- LLM fallback ----------
+    # ---------- LLM Fallback ----------
     if answer_value is None:
+        print("\n---- PROMPT SENT TO LLM ----")
+        print("QUESTION:\n", question_text)
+        print("DATA NOTES:\n", data_context_text)
+        
         llm_result = await ask_llm_for_answer(
             question_text=question_text,
             context_text=text,
             data_notes=data_context_text,
         )
 
+        print("\n---- RAW LLM RESPONSE ----")
+        print(llm_result)
+
         answer_value = llm_result.get("answer")
         llm_info = {"mode": "llm_reasoned", "llm_raw": llm_result}
 
     # ---------- Absolute Safety Net ----------
-    if answer_value is None:
+    if answer_value is None or str(answer_value).strip().lower() in ["unknown", "none", ""]:
         detected = re.search(r"-?\d+(\.\d+)?", question_text)
         if detected:
             answer_value = float(detected.group())
+            print("Fallback numeric extraction used:", answer_value)
         else:
-            answer_value = "unknown"
+            answer_value = 0
+            print("Hard fallback used: 0")
+
+    print("\n>>> FINAL ANSWER TO SUBMIT:", answer_value)
 
     # ---------- Find submit URL ----------
     submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
@@ -182,4 +202,5 @@ async def solve_quiz(
             continue
 
         return {"status": "finished_correct", "history": history}
+
 
