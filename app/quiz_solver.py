@@ -2,20 +2,84 @@ import time
 import re
 import base64
 import json
-from typing import Dict, Any, Optional, Union, List
+from typing import Dict, Any, Optional, List
 import requests
 from bs4 import BeautifulSoup
 
 from .browser import fetch_page_html_and_text
 from .llm_interface import ask_llm_for_answer
 from .utils import (
-    find_submit_url_from_text,
     find_download_links_from_html,
     normalize_url,
     download_and_load_data,
-    extract_column_sum_from_question,
-    classify_question_type,
 )
+
+
+def find_submit_url_from_content(text: str, html: str = "") -> Optional[str]:
+    """
+    Enhanced submit URL finder with multiple extraction strategies.
+    Extracts the submit URL from question text or HTML content.
+    """
+    # Strategy 1: Look for explicit "submit" or "post" mentions with URLs
+    patterns = [
+        r'[Pp]ost\s+(?:your\s+answer\s+)?to\s+(https?://[^\s<>"\']+)',
+        r'[Ss]ubmit\s+(?:your\s+answer\s+)?to\s+(https?://[^\s<>"\']+)',
+        r'[Ss]end\s+(?:your\s+answer\s+)?to\s+(https?://[^\s<>"\']+)',
+        r'POST\s+to\s+(https?://[^\s<>"\']+)',
+        r'endpoint[:\s]+(https?://[^\s<>"\']+/submit[^\s<>"\']*)',
+        r'submit[^\w]+(https?://[^\s<>"\']+)',
+        r'answer\s+to\s+(https?://[^\s<>"\']+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            url = match.group(1).rstrip('.,;:!?')
+            return url
+    
+    # Strategy 2: Look in HTML for forms or data-submit attributes
+    if html:
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Check form actions
+        for form in soup.find_all('form'):
+            action = form.get('action')
+            if action and 'submit' in action.lower():
+                if action.startswith('http'):
+                    return action
+        
+        # Check for data-submit or similar attributes
+        for tag in soup.find_all(attrs={'data-submit': True}):
+            return tag['data-submit']
+        
+        for tag in soup.find_all(attrs={'data-submit-url': True}):
+            return tag['data-submit-url']
+    
+    # Strategy 3: Look for any URL containing "submit"
+    all_urls = re.findall(r'https?://[^\s<>"\']+', text)
+    for url in all_urls:
+        if 'submit' in url.lower():
+            return url.rstrip('.,;:!?')
+    
+    # Strategy 4: Extract from code blocks or pre tags in HTML
+    if html:
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Check code blocks
+        for code in soup.find_all(['code', 'pre']):
+            code_text = code.get_text()
+            for pattern in patterns:
+                match = re.search(pattern, code_text, re.IGNORECASE)
+                if match:
+                    return match.group(1).rstrip('.,;:!?')
+            
+            # Also check for URLs in JSON payloads inside code blocks
+            json_urls = re.findall(r'https?://[^\s<>"\']+', code_text)
+            for url in json_urls:
+                if 'submit' in url.lower():
+                    return url.rstrip('.,;:!?')
+    
+    return None
 
 
 async def solve_single_quiz(
@@ -33,7 +97,9 @@ async def solve_single_quiz(
     5. Submitting the answer
     """
 
-    # Fetch the quiz page (with JS rendering via headless browser)
+    # ======================================================
+    # STEP 1: FETCH THE QUIZ PAGE (WITH JS RENDERING)
+    # ======================================================
     html, text = await fetch_page_html_and_text(quiz_url)
     soup = BeautifulSoup(html, "html.parser")
     question_text = text.strip()
@@ -42,7 +108,7 @@ async def solve_single_quiz(
     llm_info = {}
 
     # ======================================================
-    # STEP 1: EXTRACT ALL AVAILABLE RESOURCES
+    # STEP 2: EXTRACT ALL AVAILABLE RESOURCES
     # ======================================================
     
     # Extract all URLs (links to scrape, APIs, data files)
@@ -75,8 +141,8 @@ async def solve_single_quiz(
         if src and src.startswith('http'):
             all_urls.add(src)
     
-    # Extract submit URL (never hardcode!)
-    submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
+    # Extract submit URL (CRITICAL: never hardcode!)
+    submit_url = find_submit_url_from_content(text, html)
     
     # Separate URLs by type
     current_page_url = quiz_url
@@ -86,7 +152,7 @@ async def solve_single_quiz(
     download_links = find_download_links_from_html(html)
 
     # ======================================================
-    # STEP 2: UNDERSTAND THE QUESTION TYPE
+    # STEP 3: UNDERSTAND THE QUESTION TYPE
     # ======================================================
     
     # Use LLM to understand what the question is asking for
@@ -118,12 +184,12 @@ Respond with:
         }
 
     # ======================================================
-    # STEP 3: SCRAPE EXTERNAL PAGES IF NEEDED
+    # STEP 4: SCRAPE EXTERNAL PAGES IF NEEDED
     # ======================================================
     
     scraped_data = []
     
-    if task_info.get("needs_external_url") and other_urls:
+    if (task_info.get("needs_external_url") or task_info.get("task_type") == "scraping") and other_urls:
         for url in other_urls:
             try:
                 sub_html, sub_text = await fetch_page_html_and_text(url)
@@ -137,33 +203,44 @@ Respond with:
                 if task_info.get("key_terms"):
                     for term in task_info["key_terms"]:
                         # Look for "term: value" or "term = value" patterns
-                        pattern = rf"{re.escape(term)}[^\w]*[:\-=]?\s*([^\s<>\"']+)"
-                        match = re.search(pattern, sub_text, re.IGNORECASE)
-                        if match:
-                            potential_answer = match.group(1).strip()
-                            if answer_value is None:
-                                answer_value = potential_answer
-                                llm_info = {
-                                    "mode": "scrape_pattern_match",
-                                    "source": url,
-                                    "term": term,
-                                }
-                                break
+                        # More flexible pattern matching
+                        patterns = [
+                            rf"{re.escape(term)}[^\w]*[:\-=]?\s*([^\s<>\"']+)",
+                            rf"{re.escape(term)}[^\w]*is[^\w]*([^\s<>\"']+)",
+                            rf"<[^>]*{re.escape(term)}[^>]*>([^<]+)</",
+                        ]
+                        
+                        for pattern in patterns:
+                            match = re.search(pattern, sub_text, re.IGNORECASE)
+                            if match:
+                                potential_answer = match.group(1).strip()
+                                if answer_value is None and potential_answer:
+                                    answer_value = potential_answer
+                                    llm_info = {
+                                        "mode": "scrape_pattern_match",
+                                        "source": url,
+                                        "term": term,
+                                    }
+                                    break
+                        
+                        if answer_value:
+                            break
                 
                 if answer_value:
                     break
                     
             except Exception as e:
+                print(f"Error scraping {url}: {e}")
                 continue
 
     # ======================================================
-    # STEP 4: DOWNLOAD AND PROCESS FILES
+    # STEP 5: DOWNLOAD AND PROCESS FILES
     # ======================================================
     
     dataframes = []
     file_data = []
     
-    if task_info.get("needs_file_download") or download_links:
+    if task_info.get("needs_file_download") or download_links or task_info.get("task_type") == "data_analysis":
         for link in download_links:
             try:
                 full_link = normalize_url(quiz_url, link)
@@ -177,10 +254,11 @@ Respond with:
                     })
                     file_data.append(meta)
             except Exception as e:
+                print(f"Error downloading {link}: {e}")
                 continue
 
     # ======================================================
-    # STEP 5: HANDLE API CALLS
+    # STEP 6: HANDLE API CALLS
     # ======================================================
     
     api_data = []
@@ -188,7 +266,7 @@ Respond with:
     if task_info.get("task_type") == "api" or "api" in question_text.lower():
         for url in other_urls:
             # Check if URL looks like an API endpoint
-            if any(indicator in url.lower() for indicator in ['/api/', '.json', '/v1/', '/v2/']):
+            if any(indicator in url.lower() for indicator in ['/api/', '.json', '/v1/', '/v2/', 'api.']):
                 try:
                     # Extract headers if mentioned in the question
                     headers = {}
@@ -209,16 +287,25 @@ Respond with:
                     
                     # Try API call
                     response = requests.get(url, headers=headers, timeout=30)
+                    
+                    # Parse response based on content type
+                    content_type = response.headers.get('content-type', '')
+                    if 'application/json' in content_type:
+                        data = response.json()
+                    else:
+                        data = response.text
+                    
                     api_data.append({
                         "url": url,
                         "status": response.status_code,
-                        "data": response.json() if response.headers.get('content-type', '').startswith('application/json') else response.text,
+                        "data": data,
                     })
-                except:
+                except Exception as e:
+                    print(f"Error calling API {url}: {e}")
                     continue
 
     # ======================================================
-    # STEP 6: INTELLIGENT ANSWER EXTRACTION
+    # STEP 7: INTELLIGENT ANSWER EXTRACTION
     # ======================================================
     
     if answer_value is None:
@@ -231,7 +318,7 @@ Respond with:
         if scraped_data:
             context_parts.append("\n\nSCRAPED PAGES:")
             for item in scraped_data:
-                context_parts.append(f"\nURL: {item['url']}\nContent: {item['text'][:1000]}")
+                context_parts.append(f"\nURL: {item['url']}\nContent: {item['text'][:2000]}")
         
         if dataframes:
             context_parts.append("\n\nDATA FILES:")
@@ -240,31 +327,54 @@ Respond with:
                 context_parts.append(f"\nFile: {item['url']}")
                 context_parts.append(f"Columns: {list(df.columns)}")
                 context_parts.append(f"Shape: {df.shape}")
-                context_parts.append(f"First few rows:\n{df.head().to_string()}")
+                context_parts.append(f"First few rows:\n{df.head(10).to_string()}")
+                
+                # Add basic statistics if numeric columns exist
+                numeric_cols = df.select_dtypes(include=['number']).columns
+                if len(numeric_cols) > 0:
+                    context_parts.append(f"Summary statistics:\n{df[numeric_cols].describe().to_string()}")
         
         if api_data:
             context_parts.append("\n\nAPI RESPONSES:")
             for item in api_data:
                 context_parts.append(f"\nAPI: {item['url']}")
-                context_parts.append(f"Data: {json.dumps(item['data'])[:500]}")
+                context_parts.append(f"Status: {item['status']}")
+                data_str = json.dumps(item['data'], indent=2) if isinstance(item['data'], dict) else str(item['data'])
+                context_parts.append(f"Data: {data_str[:1000]}")
         
         full_context = "\n".join(context_parts)
         
         # Ask LLM to solve based on all available information
         llm_result = await ask_llm_for_answer(
-            question_text=f"""Based on all the information provided, answer this question.
-            
+            question_text=f"""Based on all the information provided, answer this question EXACTLY as requested.
+
 Question: {question_text}
 
 Expected answer type: {task_info.get('expected_answer_type', 'unknown')}
 
-Provide ONLY the answer value, nothing else. If it's a number, return just the number. If it's a string, return just the string. If it's JSON, return valid JSON. If you need to create a visualization, return it as a base64 data URI.""",
+IMPORTANT INSTRUCTIONS:
+- Provide ONLY the answer value, nothing else.
+- If it's a number, return just the number (e.g., 12345).
+- If it's a string, return just the string (e.g., secretcode123).
+- If it's JSON, return valid JSON only.
+- If you need to create a visualization, return it as a base64 data URI.
+- Do NOT include any explanation, preamble, or additional text.
+- Do NOT include the question in your response.
+- Just the answer value.""",
             context_text=full_context,
             data_notes="",
         )
         
-        if llm_result.get("answer") not in [None, "", "unknown"]:
-            answer_value = llm_result["answer"]
+        raw_answer = llm_result.get("answer", "")
+        
+        if raw_answer and raw_answer not in [None, "", "unknown", "Unknown"]:
+            # Clean up the answer
+            answer_value = raw_answer.strip()
+            
+            # Remove common LLM artifacts
+            answer_value = re.sub(r'^(Answer:|Response:|Result:)\s*', '', answer_value, flags=re.IGNORECASE)
+            answer_value = answer_value.strip()
+            
             llm_info = {
                 "mode": "llm_comprehensive",
                 "task_type": task_info.get("task_type"),
@@ -276,7 +386,7 @@ Provide ONLY the answer value, nothing else. If it's a number, return just the n
             }
 
     # ======================================================
-    # STEP 7: TYPE CONVERSION AND VALIDATION
+    # STEP 8: TYPE CONVERSION AND VALIDATION
     # ======================================================
     
     if answer_value is not None:
@@ -285,7 +395,9 @@ Provide ONLY the answer value, nothing else. If it's a number, return just the n
         
         if expected_type == "number" and isinstance(answer_value, str):
             try:
-                answer_value = float(answer_value) if "." in answer_value else int(answer_value)
+                # Remove any commas or whitespace
+                clean_num = answer_value.replace(",", "").replace(" ", "")
+                answer_value = float(clean_num) if "." in clean_num else int(clean_num)
             except:
                 pass
         
@@ -299,19 +411,28 @@ Provide ONLY the answer value, nothing else. If it's a number, return just the n
                 pass
 
     # ======================================================
-    # STEP 8: FINAL FALLBACK
+    # STEP 9: FINAL FALLBACK
     # ======================================================
     
-    if answer_value is None:
+    if answer_value is None or answer_value == "":
         # Last resort: extract first number or prominent text
         num_match = re.search(r"-?\d+(?:\.\d+)?", text)
         if num_match:
             answer_value = float(num_match.group()) if "." in num_match.group() else int(num_match.group())
         else:
-            answer_value = "unknown"
+            # Try to find any prominent text that might be the answer
+            # Look for text in headings or emphasized elements
+            for tag in soup.find_all(['h1', 'h2', 'h3', 'strong', 'b']):
+                tag_text = tag.get_text().strip()
+                if len(tag_text) > 0 and len(tag_text) < 100:
+                    answer_value = tag_text
+                    break
+            
+            if not answer_value:
+                answer_value = "unknown"
 
     # ======================================================
-    # STEP 9: SUBMIT ANSWER
+    # STEP 10: SUBMIT ANSWER
     # ======================================================
     
     if not submit_url:
@@ -320,6 +441,10 @@ Provide ONLY the answer value, nothing else. If it's a number, return just the n
             "error": "No submit URL found in the question",
             "used_answer": answer_value,
             "llm_info": llm_info,
+            "debug_info": {
+                "question_preview": question_text[:500],
+                "html_preview": html[:500] if html else None,
+            }
         }
     
     payload = {
@@ -354,6 +479,13 @@ Provide ONLY the answer value, nothing else. If it's a number, return just the n
             "llm_info": llm_info,
         }
         
+    except requests.exceptions.HTTPError as e:
+        return {
+            "correct": False,
+            "error": f"HTTP Error: {e.response.status_code} - {e.response.text[:200]}",
+            "used_answer": answer_value,
+            "llm_info": llm_info,
+        }
     except Exception as e:
         return {
             "correct": False,
@@ -375,6 +507,9 @@ async def solve_quiz(
     - Solves multiple questions in sequence
     - Handles retries within 3-minute window
     - Follows next URLs until quiz is complete
+    
+    Returns:
+        Dictionary with status, history, and results
     """
     
     current_url = start_url
@@ -397,6 +532,11 @@ async def solve_quiz(
         time_left = timeout_seconds - elapsed
         
         # Solve the current quiz
+        print(f"\n{'='*60}")
+        print(f"Attempting quiz at: {current_url}")
+        print(f"Attempt #{attempts_on_current + 1}, Time left: {time_left:.1f}s")
+        print(f"{'='*60}\n")
+        
         result = await solve_single_quiz(
             email=email,
             secret=secret,
@@ -417,16 +557,28 @@ async def solve_quiz(
             "elapsed_seconds": elapsed,
         })
         
+        # Log result
+        if result.get("correct"):
+            print(f"✓ CORRECT! Answer: {result.get('used_answer')}")
+        else:
+            print(f"✗ INCORRECT. Answer: {result.get('used_answer')}")
+            if result.get("reason"):
+                print(f"  Reason: {result.get('reason')}")
+            if result.get("error"):
+                print(f"  Error: {result.get('error')}")
+        
         # Handle the result
         if result.get("correct"):
             # Answer was correct!
             if result.get("url"):
                 # There's a next question
+                print(f"→ Moving to next question: {result.get('url')}")
                 current_url = result["url"]
                 attempts_on_current = 0  # Reset attempts for new question
                 continue
             else:
                 # Quiz is complete!
+                print("\n🎉 QUIZ COMPLETED SUCCESSFULLY!")
                 return {
                     "status": "completed",
                     "history": history,
@@ -444,9 +596,11 @@ async def solve_quiz(
                 
                 if attempts_on_current < max_retries_per_question and time_left > 30:
                     # We have time and retries left, try again
+                    print(f"→ Retrying current question (attempt {attempts_on_current + 1}/{max_retries_per_question})")
                     continue
                 else:
                     # Skip to next question
+                    print(f"→ Skipping to next question: {next_url}")
                     current_url = next_url
                     attempts_on_current = 0
                     continue
@@ -455,9 +609,11 @@ async def solve_quiz(
                 # No next URL provided
                 if attempts_on_current < max_retries_per_question and time_left > 30:
                     # Retry the same question
+                    print(f"→ Retrying current question (attempt {attempts_on_current + 1}/{max_retries_per_question})")
                     continue
                 else:
                     # Give up on this question
+                    print(f"\n✗ Failed after {attempts_on_current} attempts")
                     return {
                         "status": "failed",
                         "history": history,
