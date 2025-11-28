@@ -1,163 +1,353 @@
-import os
-import json
+import time
 import re
-from typing import Dict, Any
+import json
+from typing import Dict, Any, List, Optional
 import requests
-from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
-load_dotenv()
-AIPIPE_TOKEN = os.getenv("OPENAI_API_KEY")
-AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://aipipe.org/openai/v1")
-AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4.1-mini")
+from .browser import fetch_page_html_and_text
+from .llm_interface import ask_llm_for_answer
+from .utils import (
+    find_submit_url_from_text,
+    find_download_links_from_html,
+    normalize_url,
+    download_and_load_data,
+    extract_column_sum_from_question,
+)
 
 
-async def ask_llm_for_answer(
-    question_text: str,
-    context_text: str = "",
-    data_notes: str = "",
+async def solve_quiz(
+    email: str,
+    secret: str,
+    start_url: str,
+    start_time: float,
+    timeout_seconds: int = 170,
 ) -> Dict[str, Any]:
     """
-    LLM Interface (Computation Engine)
-    Role: Derive the correct answer from provided content.
-    Returns ONLY structured result: {"answer": value}
+    Main orchestration function for solving quiz chain.
+    
+    Args:
+        email: Student email
+        secret: Student secret
+        start_url: Initial quiz URL
+        start_time: Unix timestamp when POST was received
+        timeout_seconds: Maximum time allowed (default 170s, 10s buffer)
+    
+    Returns:
+        Dictionary with completion status and results
     """
-    if not AIPIPE_TOKEN:
-        return {"answer": None, "error": "Missing AI token"}
     
-    system_prompt = (
-        "You are a deterministic reasoning engine for automated quiz solving. "
-        "You will receive a task description and related data/context. "
-        "Your job is to compute the ACTUAL correct answer.\n\n"
-        
-        "CRITICAL RULES:\n"
-        "1. You may see example JSON payloads in the page content that include fields like:\n"
-        "   {\"email\": \"...\", \"secret\": \"...\", \"url\": \"...\", \"answer\": <placeholder>}\n"
-        "   These are EXAMPLES ONLY. The 'answer' field in these examples is ALWAYS WRONG.\n"
-        "   NEVER copy or return the example payload structure.\n\n"
-        
-        "2. You must COMPUTE the true answer based on the question and data provided.\n\n"
-        
-        "3. Output ONLY this exact JSON format:\n"
-        "   {\"answer\": <your_computed_value>}\n"
-        "   where <your_computed_value> can be a number, string, boolean, or object.\n\n"
-        
-        "4. DO NOT include:\n"
-        "   - email, secret, or url fields\n"
-        "   - explanation or reasoning\n"
-        "   - markdown formatting\n"
-        "   - any text outside the JSON\n\n"
-        
-        "5. NEVER use placeholder values like:\n"
-        "   - 'your email', 'your secret'\n"
-        "   - 'placeholder', 'example'\n"
-        "   - Numbers from example payloads (like 12345)\n\n"
-        
-        "6. If you cannot determine the answer, respond: {\"answer\": null}\n\n"
-        
-        "Example correct responses:\n"
-        "- {\"answer\": 47832}\n"
-        "- {\"answer\": \"Paris\"}\n"
-        "- {\"answer\": true}\n"
-        "- {\"answer\": {\"metric\": \"GDP\", \"value\": 2.5}}\n\n"
-        
-        "Example WRONG responses (DO NOT DO THIS):\n"
-        "- {\"email\": \"...\", \"secret\": \"...\", \"url\": \"...\", \"answer\": 12345}\n"
-        "- The answer is 12345\n"
-        "- {\"answer\": \"placeholder value\"}"
-    )
+    visited_urls: List[str] = []
+    results: List[Dict[str, Any]] = []
+    current_url = start_url
+    max_attempts_per_url = 2
     
-    user_prompt = f"""TASK:
-{question_text}
-
-PAGE CONTEXT (may contain example payloads - IGNORE THEM):
-{context_text[:3000]}
-
-DATA ANALYSIS:
-{data_notes}
-
-Remember: Compute the ACTUAL answer. Do NOT copy example payloads or placeholder values.
-Output format: {{"answer": <computed_value>}}"""
+    print(f"[SOLVER] Starting quiz chain from: {start_url}")
     
-    headers = {
-        "Authorization": f"Bearer {AIPIPE_TOKEN}",
-        "Content-Type": "application/json",
+    while current_url:
+        elapsed = time.time() - start_time
+        if elapsed > timeout_seconds:
+            print(f"[SOLVER] Timeout reached ({elapsed:.1f}s)")
+            return {
+                "status": "timeout",
+                "visited_urls": visited_urls,
+                "results": results,
+                "elapsed_seconds": elapsed,
+            }
+        
+        # Prevent infinite loops
+        if current_url in visited_urls:
+            print(f"[SOLVER] Already visited {current_url}, breaking loop")
+            break
+        
+        visited_urls.append(current_url)
+        print(f"\n[SOLVER] Processing URL: {current_url}")
+        print(f"[SOLVER] Time elapsed: {elapsed:.1f}s / {timeout_seconds}s")
+        
+        # Attempt to solve current quiz page
+        quiz_result = await solve_single_quiz(
+            email=email,
+            secret=secret,
+            quiz_url=current_url,
+            start_time=start_time,
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts_per_url,
+        )
+        
+        results.append(quiz_result)
+        
+        # Extract next URL from result
+        next_url = quiz_result.get("next_url")
+        
+        if quiz_result.get("status") == "correct":
+            print(f"[SOLVER] ✓ Correct answer for {current_url}")
+            if next_url:
+                current_url = next_url
+                print(f"[SOLVER] → Moving to next URL: {next_url}")
+            else:
+                print("[SOLVER] ✓ Quiz chain complete (no next URL)")
+                break
+        
+        elif quiz_result.get("status") == "incorrect":
+            print(f"[SOLVER] ✗ Incorrect answer for {current_url}")
+            # If server provides next URL even on failure, we can skip ahead
+            if next_url:
+                print(f"[SOLVER] → Skipping to next URL: {next_url}")
+                current_url = next_url
+            else:
+                print("[SOLVER] No next URL provided, stopping")
+                break
+        
+        else:
+            # Error or unknown status
+            print(f"[SOLVER] Error processing {current_url}: {quiz_result.get('error')}")
+            break
+    
+    final_elapsed = time.time() - start_time
+    return {
+        "status": "completed",
+        "visited_urls": visited_urls,
+        "results": results,
+        "elapsed_seconds": final_elapsed,
     }
+
+
+async def solve_single_quiz(
+    email: str,
+    secret: str,
+    quiz_url: str,
+    start_time: float,
+    timeout_seconds: int,
+    max_attempts: int = 2,
+) -> Dict[str, Any]:
+    """
+    Solve a single quiz page with retry logic.
+    
+    Returns:
+        {
+            "url": quiz_url,
+            "status": "correct" | "incorrect" | "error",
+            "answer": submitted_answer,
+            "next_url": next_quiz_url or None,
+            "attempts": attempt_count,
+            "reason": failure_reason if any,
+        }
+    """
+    
+    result = {
+        "url": quiz_url,
+        "status": "error",
+        "answer": None,
+        "next_url": None,
+        "attempts": 0,
+        "reason": None,
+    }
+    
+    try:
+        # Step 1: Fetch page content
+        print(f"[QUIZ] Fetching page: {quiz_url}")
+        html, visible_text = await fetch_page_html_and_text(quiz_url)
+        
+        if not visible_text:
+            result["error"] = "No visible text extracted from page"
+            return result
+        
+        print(f"[QUIZ] Extracted {len(visible_text)} chars of visible text")
+        
+        # Step 2: Find submit URL
+        submit_url = find_submit_url_from_text(html)
+        if not submit_url:
+            submit_url = find_submit_url_from_text(visible_text)
+        
+        if not submit_url:
+            result["error"] = "Could not find submit URL in page"
+            return result
+        
+        print(f"[QUIZ] Submit URL: {submit_url}")
+        
+        # Step 3: Detect and process data sources
+        data_context = ""
+        data_links = find_download_links_from_html(html)
+        
+        if data_links:
+            print(f"[QUIZ] Found {len(data_links)} data link(s)")
+            for link in data_links[:3]:  # Process max 3 data files
+                full_url = normalize_url(quiz_url, link)
+                print(f"[QUIZ] Downloading: {full_url}")
+                
+                try:
+                    meta, df = download_and_load_data(full_url)
+                    
+                    # Simple heuristic: if question asks for sum of a column, compute it
+                    col_name = extract_column_sum_from_question(visible_text)
+                    if col_name and col_name in df.columns:
+                        computed_sum = df[col_name].sum()
+                        meta += f"\n\n**COMPUTED: sum of '{col_name}' column = {computed_sum}**"
+                        print(f"[QUIZ] Computed sum of '{col_name}': {computed_sum}")
+                    
+                    data_context += f"\n\n--- Data from {full_url} ---\n{meta}\n"
+                    
+                except Exception as e:
+                    print(f"[QUIZ] Failed to process {full_url}: {e}")
+                    data_context += f"\n\n--- Failed to load {full_url}: {e} ---\n"
+        
+        # Step 4: Attempt submission (with retries)
+        for attempt in range(1, max_attempts + 1):
+            elapsed = time.time() - start_time
+            if elapsed > timeout_seconds:
+                result["status"] = "timeout"
+                result["reason"] = "Exceeded time limit"
+                return result
+            
+            result["attempts"] = attempt
+            print(f"\n[QUIZ] Attempt {attempt}/{max_attempts}")
+            
+            # Get answer from LLM
+            llm_response = await ask_llm_for_answer(
+                question_text=visible_text,
+                context_text=html[:5000],  # Limit HTML context
+                data_notes=data_context,
+            )
+            
+            if "error" in llm_response:
+                print(f"[QUIZ] LLM error: {llm_response['error']}")
+                result["error"] = llm_response["error"]
+                continue
+            
+            answer = llm_response.get("answer")
+            if answer is None:
+                print("[QUIZ] LLM returned null answer")
+                result["error"] = "LLM could not determine answer"
+                continue
+            
+            print(f"[QUIZ] LLM answer: {answer} (type: {type(answer).__name__})")
+            result["answer"] = answer
+            
+            # Submit answer
+            submission_result = submit_answer(
+                submit_url=submit_url,
+                email=email,
+                secret=secret,
+                quiz_url=quiz_url,
+                answer=answer,
+            )
+            
+            if submission_result.get("success"):
+                is_correct = submission_result.get("correct", False)
+                next_url = submission_result.get("next_url")
+                reason = submission_result.get("reason")
+                
+                result["status"] = "correct" if is_correct else "incorrect"
+                result["next_url"] = next_url
+                result["reason"] = reason
+                
+                if is_correct:
+                    print(f"[QUIZ] ✓ Answer accepted!")
+                    return result
+                else:
+                    print(f"[QUIZ] ✗ Wrong answer: {reason}")
+                    # If we got a next URL even on wrong answer, we can proceed
+                    if next_url:
+                        print(f"[QUIZ] Server provided next URL despite wrong answer")
+                        return result
+                    # Otherwise retry if attempts remain
+                    if attempt < max_attempts:
+                        print(f"[QUIZ] Retrying... ({attempt + 1}/{max_attempts})")
+                        continue
+                    else:
+                        return result
+            else:
+                # Submission failed (network, server error, etc.)
+                error = submission_result.get("error", "Unknown submission error")
+                print(f"[QUIZ] Submission failed: {error}")
+                result["error"] = error
+                
+                if attempt < max_attempts:
+                    time.sleep(1)  # Brief pause before retry
+                    continue
+                else:
+                    return result
+        
+        return result
+        
+    except Exception as e:
+        print(f"[QUIZ] Exception in solve_single_quiz: {e}")
+        result["error"] = str(e)
+        return result
+
+
+def submit_answer(
+    submit_url: str,
+    email: str,
+    secret: str,
+    quiz_url: str,
+    answer: Any,
+) -> Dict[str, Any]:
+    """
+    Submit answer to the quiz endpoint.
+    
+    Returns:
+        {
+            "success": bool,
+            "correct": bool (if success),
+            "next_url": str or None (if success),
+            "reason": str or None (if success),
+            "error": str (if not success),
+        }
+    """
     
     payload = {
-        "model": AIPIPE_MODEL,
-        "temperature": 0.0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        "email": email,
+        "secret": secret,
+        "url": quiz_url,
+        "answer": answer,
     }
     
-    try:
-        response = requests.post(
-            f"{AIPIPE_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
-        response.raise_for_status()
-        result = response.json()
-    except Exception as e:
-        return {"answer": None, "error": f"LLM request failed: {str(e)}"}
+    # Ensure payload is under 1MB
+    payload_json = json.dumps(payload)
+    if len(payload_json) > 1_000_000:
+        return {
+            "success": False,
+            "error": f"Payload too large: {len(payload_json)} bytes (max 1MB)"
+        }
     
     try:
-        raw_content = result["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return {"answer": None, "error": "Malformed LLM response", "raw": result}
-    
-    # Remove markdown code fences if present
-    raw_content = re.sub(r'^```json\s*|\s*```$', '', raw_content, flags=re.MULTILINE)
-    raw_content = raw_content.strip()
-    
-    # --- STRICT JSON PARSING ---
-    try:
-        parsed = json.loads(raw_content)
+        print(f"[SUBMIT] POST to {submit_url}")
+        print(f"[SUBMIT] Payload size: {len(payload_json)} bytes")
         
-        # CRITICAL CHECK: Reject if this looks like a full submission payload
-        if isinstance(parsed, dict):
-            # If it has the submission structure, it's wrong
-            if "email" in parsed and "secret" in parsed and "url" in parsed:
-                print("[LLM] WARNING: LLM returned submission payload structure, rejecting")
-                return {"answer": None, "error": "LLM returned invalid payload structure"}
-            
-            # Extract answer field
-            if "answer" in parsed:
-                answer_val = parsed["answer"]
-                
-                # Reject placeholder strings
-                if isinstance(answer_val, str):
-                    lower_val = answer_val.lower()
-                    if any(x in lower_val for x in ["secret", "placeholder", "example", "your email", "anything you want"]):
-                        return {"answer": None, "error": "Rejected placeholder output"}
-                
-                return {"answer": answer_val}
-            
-            # If it's a dict without "answer" key, assume the dict itself is the answer
-            return {"answer": parsed}
+        response = requests.post(
+            submit_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        
+        print(f"[SUBMIT] Response status: {response.status_code}")
+        
+        if response.status_code != 200:
+            return {
+                "success": False,
+                "error": f"HTTP {response.status_code}: {response.text[:200]}"
+            }
+        
+        response_data = response.json()
+        print(f"[SUBMIT] Response: {json.dumps(response_data, indent=2)}")
+        
+        return {
+            "success": True,
+            "correct": response_data.get("correct", False),
+            "next_url": response_data.get("url"),
+            "reason": response_data.get("reason"),
+        }
+        
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "Request timeout (30s)"}
     
-    except json.JSONDecodeError:
-        pass
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "error": f"Request failed: {str(e)}"}
     
-    # --- Controlled numeric fallback ---
-    number_match = re.fullmatch(r"-?\d+(?:\.\d+)?", raw_content)
-    if number_match:
-        num_val = float(raw_content) if '.' in raw_content else int(raw_content)
-        return {"answer": num_val}
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON response: {str(e)}"}
     
-    # --- Boolean fallback ---
-    if raw_content.lower() in ["true", "false"]:
-        return {"answer": raw_content.lower() == "true"}
-    
-    # --- Final defensive fallback ---
-    cleaned = raw_content.replace("\n", " ").strip()
-    if cleaned and len(cleaned) < 500:  # Reasonable answer length
-        # Check for placeholders one more time
-        if any(x in cleaned.lower() for x in ["placeholder", "example", "your email", "your secret"]):
-            return {"answer": None, "error": "Rejected placeholder in text output"}
-        return {"answer": cleaned}
-    
-    return {"answer": None, "error": "Unusable LLM output", "raw_output": raw_content[:200]}
+    except Exception as e:
+        return {"success": False, "error": f"Unexpected error: {str(e)}"}
