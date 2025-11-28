@@ -1,6 +1,6 @@
 import time
-from typing import Dict, Any
 import re
+from typing import Dict, Any
 import requests
 from bs4 import BeautifulSoup
 
@@ -31,36 +31,33 @@ async def solve_single_quiz(
     llm_info = {}
 
     # ======================================================
-    # 1. GENERIC URL SCRAPE HANDLER (PROTOCOL FOLLOWER)
+    # 1. AUTO FOLLOW EMBEDDED TASK URLS (JS rendered)
     # ======================================================
 
-    all_urls = re.findall(r"https?://[^\s\"'>]+", text)
+    embedded_urls = re.findall(r"https?://[^\s\"'>]+", text)
 
-    for target_url in all_urls:
+    for url in embedded_urls:
+        if quiz_url in url:
+            continue
         try:
-            resp = requests.get(target_url, timeout=20)
-            if resp.status_code != 200:
-                continue
+            sub_html, sub_text = await fetch_page_html_and_text(url)
+            sub_text = sub_text.strip()
 
-            sub_page = resp.text
-
-            # Look for structured keywords
-            match = re.search(
-                r"(secret|code|token|answer)[^\w]*[:\-]?\s*([A-Za-z0-9_-]{4,})",
-                sub_page,
+            token_match = re.search(
+                r"(secret|code|token|answer)[^\w]*[:\-]?\s*([A-Za-z0-9_-]{3,})",
+                sub_text,
                 re.IGNORECASE
             )
 
-            if match:
-                answer_value = match.group(2)
-                llm_info = {"mode": "scrape_auto", "source": target_url}
+            if token_match:
+                answer_value = token_match.group(2)
+                llm_info = {"mode": "scrape_auto", "source": url}
                 break
-
-        except Exception:
+        except:
             continue
 
     # ======================================================
-    # 2. LOAD DATA FILES IF PRESENT
+    # 2. DATA FILE HANDLING (CSV, XLS, JSON etc)
     # ======================================================
 
     download_links = find_download_links_from_html(html)
@@ -71,34 +68,28 @@ async def solve_single_quiz(
         try:
             full_link = normalize_url(quiz_url, link)
             meta, df = download_and_load_data(full_link)
+            dataframes.append({"df": df})
             data_context_parts.append(meta)
-            dataframes.append({"url": full_link, "df": df})
         except:
             pass
 
     data_context_text = "\n\n".join(data_context_parts)
 
-    # ======================================================
-    # 3. NUMERIC DATA HANDLER
-    # ======================================================
-
     if answer_value is None and dataframes:
         question_type = classify_question_type(question_text)
         if question_type == "numeric":
-            col_name = extract_column_sum_from_question(question_text)
-            if col_name:
+            col = extract_column_sum_from_question(question_text)
+            if col:
                 for item in dataframes:
                     df = item["df"]
-                    col_map = {c.lower(): c for c in df.columns}
-                    if col_name.lower() in col_map:
-                        real_col = col_map[col_name.lower()]
-                        s = df[real_col].sum()
-                        answer_value = float(s)
+                    match_col = next((c for c in df.columns if c.lower() == col.lower()), None)
+                    if match_col:
+                        answer_value = float(df[match_col].sum())
                         llm_info = {"mode": "numeric_auto"}
                         break
 
     # ======================================================
-    # 4. LLM FALLBACK ONLY IF NO HARD LOGIC APPLIED
+    # 3. STRICT LLM FALLBACK ONLY WHEN ALL ELSE FAILS
     # ======================================================
 
     if answer_value is None:
@@ -107,27 +98,29 @@ async def solve_single_quiz(
             context_text=text,
             data_notes=data_context_text,
         )
-        answer_value = llm_result.get("answer")
-        llm_info = {"mode": "llm_fallback", "llm_raw": llm_result}
+
+        if llm_result.get("answer") not in [None, "", "unknown"]:
+            answer_value = llm_result["answer"]
+            llm_info = {"mode": "llm_fallback", "llm_raw": llm_result}
 
     # ======================================================
-    # 5. FINAL SAFETY NET
+    # 4. FINAL DEFENSIVE GUARD
     # ======================================================
 
-    if answer_value in [None, "", "unknown"]:
-        match = re.search(r"-?\d+(\.\d+)?", question_text)
-        answer_value = float(match.group()) if match else "unknown"
+    if answer_value is None:
+        num = re.search(r"-?\d+(\.\d+)?", text)
+        answer_value = float(num.group()) if num else "unknown"
 
     # ======================================================
-    # 6. SUBMIT ANSWER
+    # 5. SUBMIT ANSWER
     # ======================================================
 
     submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
 
-    if submit_url is None:
+    if not submit_url:
         return {
             "correct": False,
-            "error": "Submit URL not found",
+            "error": "Submit URL not detected",
             "used_answer": answer_value,
             "llm_info": llm_info,
         }
@@ -152,7 +145,7 @@ async def solve_single_quiz(
         }
 
     return {
-        "correct": bool(data.get("correct", False)),
+        "correct": bool(data.get("correct")),
         "url": data.get("url"),
         "reason": data.get("reason"),
         "used_answer": answer_value,
@@ -172,17 +165,14 @@ async def solve_quiz(
     history = []
 
     while True:
-        elapsed = time.time() - start_time
-        remaining = timeout_seconds - elapsed
-
-        if remaining <= 0:
+        if time.time() - start_time > timeout_seconds:
             return {"status": "timeout", "history": history}
 
         result = await solve_single_quiz(
             email=email,
             secret=secret,
             quiz_url=current_url,
-            time_left_seconds=remaining,
+            time_left_seconds=timeout_seconds,
         )
 
         history.append({
@@ -197,7 +187,8 @@ async def solve_quiz(
             current_url = result["url"]
             continue
 
-        if result.get("correct"):
-            return {"status": "finished_correct", "history": history}
+        return {
+            "status": "finished_correct" if result.get("correct") else "finished_incorrect",
+            "history": history,
+        }
 
-        return {"status": "finished_incorrect", "history": history}
