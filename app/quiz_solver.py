@@ -25,39 +25,39 @@ async def solve_single_quiz(
 
     html, text = await fetch_page_html_and_text(quiz_url)
     soup = BeautifulSoup(html, "html.parser")
-
     question_text = text.strip()
 
     answer_value = None
     llm_info = {}
 
     # ======================================================
-    # 1. HARD FIX: SCRAPE DEMO TASK HANDLER
+    # 1. GENERIC URL SCRAPE HANDLER (PROTOCOL FOLLOWER)
     # ======================================================
 
-    scrape_url_match = re.search(
-        r"https?://[^\s\"']*demo-scrape-data[^\s\"']*", html
-    )
+    all_urls = re.findall(r"https?://[^\s\"'>]+", text)
 
-    if scrape_url_match:
-        scrape_url = scrape_url_match.group()
+    for target_url in all_urls:
         try:
-            scrape_resp = requests.get(scrape_url, timeout=20)
-            scrape_resp.raise_for_status()
-            scrape_html = scrape_resp.text
+            resp = requests.get(target_url, timeout=20)
+            if resp.status_code != 200:
+                continue
 
-            secret_match = re.search(
-                r"Secret\s*Code\s*[:\-]?\s*([A-Za-z0-9_-]+)",
-                scrape_html,
+            sub_page = resp.text
+
+            # Look for structured keywords
+            match = re.search(
+                r"(secret|code|token|answer)[^\w]*[:\-]?\s*([A-Za-z0-9_-]{4,})",
+                sub_page,
                 re.IGNORECASE
             )
 
-            if secret_match:
-                answer_value = secret_match.group(1)
-                llm_info = {"mode": "scrape_auto"}
+            if match:
+                answer_value = match.group(2)
+                llm_info = {"mode": "scrape_auto", "source": target_url}
+                break
 
-        except Exception as e:
-            answer_value = None
+        except Exception:
+            continue
 
     # ======================================================
     # 2. LOAD DATA FILES IF PRESENT
@@ -98,7 +98,7 @@ async def solve_single_quiz(
                         break
 
     # ======================================================
-    # 4. LLM FALLBACK (ONLY WHEN NECESSARY)
+    # 4. LLM FALLBACK ONLY IF NO HARD LOGIC APPLIED
     # ======================================================
 
     if answer_value is None:
@@ -111,7 +111,7 @@ async def solve_single_quiz(
         llm_info = {"mode": "llm_fallback", "llm_raw": llm_result}
 
     # ======================================================
-    # 5. ABSOLUTE SAFETY NET
+    # 5. FINAL SAFETY NET
     # ======================================================
 
     if answer_value in [None, "", "unknown"]:
