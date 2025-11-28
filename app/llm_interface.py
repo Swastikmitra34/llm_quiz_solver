@@ -1,14 +1,14 @@
 import os
 import json
-from textwrap import dedent
-from typing import Optional, Dict, Any
+import re
+from typing import Dict, Any
 
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-AIPIPE_TOKEN = os.getenv("OPENAI_API_KEY")  # from aipipe.org
+AIPIPE_TOKEN = os.getenv("OPENAI_API_KEY")
 AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://api.aipipe.org/v1")
 AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4.1-mini")
 
@@ -23,32 +23,33 @@ async def ask_llm_for_answer(
         return {"answer": None, "error": "Missing OPENAI_API_KEY / AI Pipe token"}
 
     system_msg = """
-You are an automated quiz-solving engine.
-You MUST return a final answer in strict JSON format ONLY.
+You are a high-precision problem-solving AI.
+
+You MUST return the final answer in strict JSON.
+Format:
+{"answer": "<final answer>"}
 
 Rules:
-- Return ONLY JSON.
-- The JSON must contain exactly one key: "answer".
-- No explanations. No Markdown. No text outside JSON.
-
-Examples:
-{"answer": 12345}
-{"answer": "True"}
-{"answer": "Paris"}
+- Only JSON. No commentary.
+- No markdown.
+- No reasoning text.
+- If numeric, output only the number.
+- If textual, output only the final word/phrase.
 """.strip()
 
-
     user_msg = f"""
-Question:
+Solve the following quiz question.
+
+QUESTION:
 {question_text}
 
-Context:
+PAGE CONTEXT:
 {context_text}
 
-Data notes:
+DATA NOTES:
 {data_notes}
 
-Respond ONLY with valid JSON containing the key "answer".
+Return ONLY JSON with the key "answer".
 """
 
     url = f"{AIPIPE_BASE_URL}/chat/completions"
@@ -75,21 +76,28 @@ Respond ONLY with valid JSON containing the key "answer".
         return {"answer": None, "error": f"LLM request failed: {e}"}
 
     try:
-        raw_content = data["choices"][0]["message"]["content"].strip()
+        raw = data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return {"answer": None, "error": f"Unexpected LLM response format: {e}", "raw": data}
+        return {"answer": None, "error": f"Malformed LLM response", "raw": data}
 
-    # Robust JSON extraction
+    # 1. Proper JSON parsing
     try:
-        parsed = json.loads(raw_content)
-    except Exception:
-        import re
-        num_match = re.search(r"-?\d+(\.\d+)?", raw_content)
-        if num_match:
-            return {"answer": float(num_match.group())}
-        return {"answer": raw_content.strip()}
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and "answer" in parsed:
+            return {"answer": parsed["answer"]}
+    except:
+        pass
 
-    if isinstance(parsed, dict) and "answer" in parsed:
-        return parsed
+    # 2. Fallback numeric extraction
+    numeric = re.search(r"-?\d+(\.\d+)?", raw)
+    if numeric:
+        return {"answer": float(numeric.group())}
 
-    return {"answer": parsed}
+    # 3. Final fallback as cleaned text
+    cleaned = raw.replace("\n", "").strip()
+    if cleaned:
+        return {"answer": cleaned}
+
+    # 4. Absolute failsafe
+    return {"answer": "0"}
+
