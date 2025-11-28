@@ -174,7 +174,7 @@ async def solve_quiz(
     secret: str,
     start_url: str,
     start_time: float,
-    timeout: float = MAX_GLOBAL_SECONDS,
+    timeout_seconds: float = MAX_GLOBAL_SECONDS,
 ) -> Dict[str, Any]:
 
     current_url = start_url
@@ -182,7 +182,7 @@ async def solve_quiz(
 
     while True:
         elapsed = time.time() - start_time
-        remaining = timeout - elapsed
+        remaining = timeout_seconds - elapsed
 
         if remaining <= 0:
             return {"status": "timeout", "history": history}
@@ -212,4 +212,5 @@ async def solve_quiz(
             "status": "finished_correct" if result.get("correct") else "finished_incorrect",
             "history": history
         }
+
 
