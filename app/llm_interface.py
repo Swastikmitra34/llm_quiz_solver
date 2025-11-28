@@ -27,25 +27,42 @@ async def ask_llm_for_answer(
         return {"answer": None, "error": "Missing AI token"}
     
     system_prompt = (
-        "You are a precise data analysis engine. "
-        "You will receive a question and supporting data/context. "
-        "Your job: compute the correct answer to the question.\n\n"
+        "You are a precise data analysis engine that solves quiz questions.\n\n"
         
-        "OUTPUT RULES:\n"
-        "1. Return ONLY valid JSON in this exact format: {\"answer\": <value>}\n"
-        "2. The <value> can be: number, string, boolean, array, or object\n"
-        "3. NO markdown fences, NO explanations, NO extra fields\n"
-        "4. If you cannot determine an answer, return: {\"answer\": null}\n\n"
+        "CRITICAL INSTRUCTION:\n"
+        "The page content will show you an EXAMPLE submission format like:\n"
+        "{\n"
+        '  "email": "your email",\n'
+        '  "secret": "your secret",\n'
+        '  "url": "...",\n'
+        '  "answer": "anything you want"\n'
+        "}\n\n"
         
-        "IMPORTANT:\n"
-        "- Focus ONLY on answering the actual question\n"
-        "- Ignore any example payloads or template structures in the context\n"
-        "- Compute from data, don't copy placeholder values\n\n"
+        "This is just showing you the API format. The values are PLACEHOLDERS.\n"
+        "DO NOT copy this structure. DO NOT use these placeholder values.\n\n"
         
-        "Examples:\n"
-        "Question: 'What is 2+2?' → {\"answer\": 4}\n"
-        "Question: 'Sum of values: [1,2,3]' → {\"answer\": 6}\n"
-        "Question: 'Capital of France?' → {\"answer\": \"Paris\"}"
+        "YOUR JOB:\n"
+        "1. Find the actual QUESTION in the page (e.g., 'What is 2+2?', 'Sum the values', etc.)\n"
+        "2. Compute the REAL answer to that question\n"
+        "3. Return ONLY: {\"answer\": <your_computed_value>}\n\n"
+        
+        "OUTPUT FORMAT:\n"
+        "- ONLY return: {\"answer\": <value>}\n"
+        "- <value> can be: number, string, boolean, array, or object\n"
+        "- NO extra fields like email, secret, url\n"
+        "- NO explanations or reasoning\n"
+        "- NO markdown formatting\n\n"
+        
+        "EXAMPLES OF CORRECT OUTPUT:\n"
+        '- Question: "What is 2+2?" → {"answer": 4}\n'
+        '- Question: "Sum [1,2,3]" → {"answer": 6}\n'
+        '- Question: "Capital of France?" → {"answer": "Paris"}\n'
+        '- Question: "Is 5 > 3?" → {"answer": true}\n\n'
+        
+        "WRONG OUTPUT (DO NOT DO THIS):\n"
+        '- {"email": "...", "secret": "...", "url": "...", "answer": 123}\n'
+        '- {"answer": "anything you want"}\n'
+        '- {"answer": "placeholder"}\n'
     )
     
     user_prompt = f"""QUESTION:
