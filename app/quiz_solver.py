@@ -1,7 +1,7 @@
 import time
-from typing import Dict, Any
 import re
 import requests
+from typing import Dict, Any
 from bs4 import BeautifulSoup
 
 from .browser import fetch_page_html_and_text
@@ -16,11 +16,14 @@ from .utils import (
 )
 
 
-async def solve_single_quiz(
+MAX_RETRIES_PER_QUESTION = 2
+MIN_SECONDS_TO_RETRY = 20  # if less than this, skip retry
+
+
+async def solve_single_quiz_attempt(
     email: str,
     secret: str,
     quiz_url: str,
-    time_left_seconds: float,
 ) -> Dict[str, Any]:
 
     html, text = await fetch_page_html_and_text(quiz_url)
@@ -53,6 +56,7 @@ async def solve_single_quiz(
     answer_value = None
     llm_info = {}
 
+    # Deterministic numeric processing first
     if question_type == "numeric" and dataframes:
         col_name = extract_column_sum_from_question(question_text)
         if col_name:
@@ -60,8 +64,8 @@ async def solve_single_quiz(
                 df = item["df"]
                 col_map = {c.lower(): c for c in df.columns}
                 if col_name.lower() in col_map:
+                    real_col = col_map[col_name.lower()]
                     try:
-                        real_col = col_map[col_name.lower()]
                         s = df[real_col].sum()
                         answer_value = float(s) if hasattr(s, "item") else s
                         llm_info = {"mode": "numeric_auto"}
@@ -69,15 +73,24 @@ async def solve_single_quiz(
                     except:
                         pass
 
+    # LLM fallback as last resort
     if answer_value is None:
         llm_result = await ask_llm_for_answer(
             question_text=question_text,
             context_text=text,
             data_notes=data_context_text,
         )
-        answer_value = llm_result.get("answer")
+        candidate = llm_result.get("answer")
+
+        # Reject weak hallucinated answers
+        if isinstance(candidate, str) and len(candidate.strip()) < 5:
+            answer_value = None
+        else:
+            answer_value = candidate
+
         llm_info = {"mode": "llm_reasoned", "llm_raw": llm_result}
 
+    # Emergency regex fallback
     if answer_value is None:
         detected = re.search(r"-?\d+(\.\d+)?", question_text)
         answer_value = float(detected.group()) if detected else "unknown"
@@ -88,7 +101,6 @@ async def solve_single_quiz(
         return {
             "correct": False,
             "error": "Submit URL not found",
-            "url": None,
             "used_answer": answer_value,
             "llm_info": llm_info,
         }
@@ -107,15 +119,14 @@ async def solve_single_quiz(
     except Exception as e:
         return {
             "correct": False,
-            "error": f"Submission failed: {str(e)}",
-            "url": None,
+            "error": str(e),
             "used_answer": answer_value,
             "llm_info": llm_info,
         }
 
     return {
         "correct": bool(data.get("correct", False)),
-        "url": data.get("url"),
+        "next_url": data.get("url"),
         "reason": data.get("reason"),
         "used_answer": answer_value,
         "llm_info": llm_info,
@@ -126,12 +137,12 @@ async def solve_quiz(
     email: str,
     secret: str,
     start_url: str,
-    start_time: float,
     timeout_seconds: float = 170.0,
 ) -> Dict[str, Any]:
 
-    current_url = start_url
+    start_time = time.time()
     history = []
+    current_url = start_url
 
     while True:
         elapsed = time.time() - start_time
@@ -140,27 +151,43 @@ async def solve_quiz(
         if remaining <= 0:
             return {"status": "timeout", "history": history}
 
-        result = await solve_single_quiz(
-            email=email,
-            secret=secret,
-            quiz_url=current_url,
-            time_left_seconds=remaining,
-        )
+        retry_count = 0
 
-        history.append({
-            "url": current_url,
-            "correct": result.get("correct"),
-            "used_answer": result.get("used_answer"),
-            "reason": result.get("reason"),
-            "llm_info": result.get("llm_info"),
-        })
+        while retry_count <= MAX_RETRIES_PER_QUESTION:
+            question_start = time.time()
 
-        if result.get("url"):
-            current_url = result["url"]
+            result = await solve_single_quiz_attempt(
+                email=email,
+                secret=secret,
+                quiz_url=current_url,
+            )
+
+            history.append({
+                "url": current_url,
+                "correct": result.get("correct"),
+                "answer": result.get("used_answer"),
+                "reason": result.get("reason"),
+                "llm_info": result.get("llm_info"),
+            })
+
+            if result.get("correct"):
+                if result.get("next_url"):
+                    current_url = result["next_url"]
+                    break
+                return {"status": "finished_correct", "history": history}
+
+            time_spent = time.time() - question_start
+            time_left_question = remaining - time_spent
+
+            if time_left_question < MIN_SECONDS_TO_RETRY:
+                break
+
+            retry_count += 1
+
+        # Move to next URL if provided, otherwise terminate
+        if result.get("next_url"):
+            current_url = result["next_url"]
             continue
-
-        if result.get("correct"):
-            return {"status": "finished_correct", "history": history}
 
         return {"status": "finished_incorrect", "history": history}
 
