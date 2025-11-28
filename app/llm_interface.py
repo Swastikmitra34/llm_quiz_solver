@@ -2,14 +2,13 @@ import os
 import json
 import re
 from typing import Dict, Any
-
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 AIPIPE_TOKEN = os.getenv("OPENAI_API_KEY")
-AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://api.aipipe.org/v1")
+AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://aipipe.org/openai/v1")
 AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4.1-mini")
 
 
@@ -20,26 +19,14 @@ async def ask_llm_for_answer(
 ) -> Dict[str, Any]:
 
     if not AIPIPE_TOKEN:
-        return {"answer": None, "error": "Missing OPENAI_API_KEY / AI Pipe token"}
+        return {"answer": None, "error": "Missing AI Pipe token"}
 
-    system_msg = """
-You are a high-precision problem-solving AI.
-
-You MUST return the final answer in strict JSON.
-Format:
-{"answer": "<final answer>"}
-
-Rules:
-- Only JSON. No commentary.
-- No markdown.
-- No reasoning text.
-- If numeric, output only the number.
-- If textual, output only the final word/phrase.
-""".strip()
+    system_msg = (
+        "Return ONLY strict JSON as {\"answer\": value}. "
+        "No explanation. No markdown. No commentary."
+    )
 
     user_msg = f"""
-Solve the following quiz question.
-
 QUESTION:
 {question_text}
 
@@ -48,8 +35,6 @@ PAGE CONTEXT:
 
 DATA NOTES:
 {data_notes}
-
-Return ONLY JSON with the key "answer".
 """
 
     url = f"{AIPIPE_BASE_URL}/chat/completions"
@@ -69,35 +54,42 @@ Return ONLY JSON with the key "answer".
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
     except Exception as e:
-        return {"answer": None, "error": f"LLM request failed: {e}"}
+        return {
+            "answer": None,
+            "error": f"AI Pipe connection failure: {str(e)}"
+        }
 
     try:
         raw = data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return {"answer": None, "error": f"Malformed LLM response", "raw": data}
+    except Exception:
+        return {
+            "answer": None,
+            "error": "Malformed AI Pipe response",
+            "raw": data
+        }
 
-    # 1. Proper JSON parsing
+    # --- Strict JSON Parsing ---
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and "answer" in parsed:
             return {"answer": parsed["answer"]}
-    except:
+    except Exception:
         pass
 
-    # 2. Fallback numeric extraction
-    numeric = re.search(r"-?\d+(\.\d+)?", raw)
-    if numeric:
-        return {"answer": float(numeric.group())}
+    # --- Numeric fallback ---
+    match = re.search(r"-?\d+(?:\.\d+)?", raw)
+    if match:
+        return {"answer": float(match.group())}
 
-    # 3. Final fallback as cleaned text
-    cleaned = raw.replace("\n", "").strip()
+    # --- Text fallback ---
+    cleaned = raw.replace("\n", " ").strip()
     if cleaned:
         return {"answer": cleaned}
 
-    # 4. Absolute failsafe
-    return {"answer": "0"}
+    # --- Absolute failsafe ---
+    return {"answer": None, "error": "LLM produced empty output"}
 
