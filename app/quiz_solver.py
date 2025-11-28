@@ -15,19 +15,22 @@ from .utils import (
     classify_question_type,
 )
 
-
+# Retry behaviour inside the 3-minute window
 MAX_RETRIES_PER_QUESTION = 2
 MIN_SECONDS_TO_RETRY = 20
 
 
-def extract_answer_from_template(text: str):
+# -------------------- Helper functions -------------------- #
+
+def extract_answer_from_template(text: str, quiz_url: str) -> str | None:
     """
-    Detects explicit instruction blocks that show a JSON payload
-    and extracts the answer directly if present.
-    Example:
-      "answer": 12345
-      "answer": "anything you want"
+    Detects explicit JSON example payloads and extracts the "answer" field.
+    We **only** trust this in demo-style URLs (containing 'demo'),
+    so that real quiz pages are not accidentally treated as templates.
     """
+    if "demo" not in quiz_url:
+        return None
+
     match = re.search(r'"answer"\s*:\s*("?[^"\n]+")', text)
     if match:
         raw = match.group(1)
@@ -37,8 +40,8 @@ def extract_answer_from_template(text: str):
 
 def sanitize_question_text(full_text: str) -> str:
     """
-    Remove trailing instructions like 'Post your answer ...'
-    and any example JSON blobs that confuse the LLM.
+    Remove trailing instructions (like 'Post your answer ...')
+    and any example JSON blocks that confuse the LLM.
     """
     # Cut off anything after 'Post your answer'
     cleaned = re.sub(
@@ -55,19 +58,26 @@ def sanitize_question_text(full_text: str) -> str:
     return cleaned.strip()
 
 
+# -------------------- Single-quiz solver -------------------- #
+
 async def solve_single_quiz_attempt(
     email: str,
     secret: str,
     quiz_url: str,
 ) -> Dict[str, Any]:
+    """
+    Solve exactly ONE quiz URL once (no retries inside this function).
+    """
 
+    # 1. Fetch rendered page (JS executed)
     html, text = await fetch_page_html_and_text(quiz_url)
     soup = BeautifulSoup(html, "html.parser")
 
-    # ---------- 0. Try template-mode shortcut (demo-style pages) ----------
-    template_answer = extract_answer_from_template(text)
+    # 2. Find submit URL (must not be hardcoded)
     submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
 
+    # ---------------- TEMPLATE MODE (demo only) ---------------- #
+    template_answer = extract_answer_from_template(text, quiz_url)
     if template_answer and submit_url:
         payload = {
             "email": email,
@@ -76,9 +86,17 @@ async def solve_single_quiz_attempt(
             "answer": template_answer,
         }
 
-        resp = requests.post(submit_url, json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = requests.post(submit_url, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            return {
+                "correct": False,
+                "error": f"Submission failed (template mode): {e}",
+                "used_answer": template_answer,
+                "llm_info": {"mode": "template_followed"},
+            }
 
         return {
             "correct": bool(data.get("correct", False)),
@@ -88,8 +106,9 @@ async def solve_single_quiz_attempt(
             "llm_info": {"mode": "template_followed"},
         }
 
-    # ---------- 1. Extract a cleaner question text ----------
-    # Prefer lines that look like a question / start with 'Q'
+    # ---------------- QUESTION EXTRACTION ---------------- #
+
+    # Prefer lines that look like questions (start with Q... or contain 'question')
     possible = []
     for elem in soup.find_all(text=True):
         t = elem.strip()
@@ -99,7 +118,8 @@ async def solve_single_quiz_attempt(
     raw_question_text = "\n".join(possible) if possible else text.strip()
     question_text = sanitize_question_text(raw_question_text)
 
-    # ---------- 2. Load downloadable data ----------
+    # ---------------- DATA FILE HANDLING ---------------- #
+
     download_links = find_download_links_from_html(html)
     dataframes = []
     data_context_parts = []
@@ -111,18 +131,20 @@ async def solve_single_quiz_attempt(
             data_context_parts.append(meta)
             dataframes.append({"url": full_link, "df": df})
         except Exception:
-            # Ignore failed downloads, continue with others
+            # Ignore a bad file, keep going
             pass
 
     data_context_text = "\n\n".join(data_context_parts)
 
-    # ---------- 3. Classify question type ----------
-    qtype = classify_question_type(question_text)
+    # ---------------- QUESTION TYPE ---------------- #
+
+    question_type = classify_question_type(question_text)
     answer_value = None
     llm_info: Dict[str, Any] = {}
 
-    # ---------- 4. Numeric / data-first logic ----------
-    if qtype == "numeric" and dataframes:
+    # ---------------- NUMERIC / DATA-FIRST LOGIC ---------------- #
+
+    if question_type == "numeric" and dataframes:
         col_name = extract_column_sum_from_question(question_text)
         if col_name:
             for item in dataframes:
@@ -132,26 +154,43 @@ async def solve_single_quiz_attempt(
                     try:
                         s = df[col_map[col_name.lower()]].sum()
                         answer_value = float(s) if hasattr(s, "item") else s
-                        llm_info = {"mode": "numeric_auto", "column": col_map[col_name.lower()]}
+                        llm_info = {
+                            "mode": "numeric_auto",
+                            "column": col_map[col_name.lower()],
+                            "source_url": item["url"],
+                        }
                         break
                     except Exception:
-                        # Try next dataframe if one fails
+                        # Try next dataframe
                         continue
 
-    # ---------- 5. LLM only for text / generic / fallback ----------
-    # Only call LLM when:
-    # - No numeric/data logic succeeded, OR
-    # - qtype is not clearly numeric (i.e., text/llm/general)
-    if answer_value is None and (qtype != "numeric" or not dataframes):
+    # ---------------- SIMPLE SCRAPING LOGIC ---------------- #
+    # Very lightweight: detect patterns like "secret code: XYZ123"
+    if answer_value is None:
+        m = re.search(
+            r"(secret|code|token|answer)[^\w]*[:\-]\s*([A-Za-z0-9_-]{3,})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            answer_value = m.group(2)
+            llm_info = {"mode": "regex_extract", "label": m.group(1).lower()}
+
+    # ---------------- LLM FALLBACK (TEXT / GENERIC) ---------------- #
+
+    # Only call the LLM if:
+    # - numeric logic failed, OR
+    # - classify_question_type said it's not clearly numeric
+    if answer_value is None:
         llm_result = await ask_llm_for_answer(
-            question_text=question_text,        # cleaned question only
-            context_text=data_context_text,     # structured data preview, not full HTML
-            data_notes="",                      # optional extra notes
+            question_text=question_text,      # cleaned question only
+            context_text=data_context_text,   # structured data previews (no noisy HTML)
+            data_notes="",
         )
 
         candidate = llm_result.get("answer")
 
-        # Basic sanity: ignore extremely short junk like "is", "it", etc.
+        # Basic sanity: ignore trivial garbage like "is", "a", etc.
         if isinstance(candidate, str) and len(candidate.strip()) < 2:
             answer_value = None
         else:
@@ -159,13 +198,13 @@ async def solve_single_quiz_attempt(
 
         llm_info = {"mode": "llm_reasoned", "llm_raw": llm_result}
 
-    # ---------- 6. Final numeric safety net ----------
+    # ---------------- FINAL NUMERIC SAFETY NET ---------------- #
+
     if answer_value is None:
         detected = re.search(r"-?\d+(\.\d+)?", question_text)
         answer_value = float(detected.group()) if detected else "unknown"
 
-    # ---------- 7. Submit ----------
-    submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
+    # ---------------- SUBMIT ANSWER ---------------- #
 
     if submit_url is None:
         return {
@@ -182,9 +221,17 @@ async def solve_single_quiz_attempt(
         "answer": answer_value,
     }
 
-    resp = requests.post(submit_url, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.post(submit_url, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return {
+            "correct": False,
+            "error": f"Submission failed: {e}",
+            "used_answer": answer_value,
+            "llm_info": llm_info,
+        }
 
     return {
         "correct": bool(data.get("correct", False)),
@@ -195,6 +242,8 @@ async def solve_single_quiz_attempt(
     }
 
 
+# -------------------- Multi-quiz driver -------------------- #
+
 async def solve_quiz(
     email: str,
     secret: str,
@@ -202,6 +251,12 @@ async def solve_quiz(
     start_time: float,
     timeout_seconds: float = 170.0,
 ) -> Dict[str, Any]:
+    """
+    Main driver:
+    - Follows chained quiz URLs.
+    - Retries each question a limited number of times.
+    - Respects total time budget (~3 minutes).
+    """
 
     history = []
     current_url = start_url
@@ -215,7 +270,7 @@ async def solve_quiz(
 
         retry_count = 0
 
-        # Retry loop for the same question
+        # Retry loop for the same quiz URL
         while retry_count <= MAX_RETRIES_PER_QUESTION:
             question_start = time.time()
 
@@ -230,28 +285,37 @@ async def solve_quiz(
                 "correct": result.get("correct"),
                 "answer": result.get("used_answer"),
                 "reason": result.get("reason"),
+                "error": result.get("error"),
                 "llm_info": result.get("llm_info"),
             })
 
-            # Correct → either move to next URL or finish
+            # If correct:
             if result.get("correct"):
+                # If there is a next URL → move on
                 if result.get("next_url"):
                     current_url = result["next_url"]
-                    break  # break retry loop, go to next URL
+                    break  # break retry loop, go to next quiz
+                # No next URL → quiz chain finished
                 return {"status": "finished_correct", "history": history}
 
-            # Incorrect → check if we still have time to retry
+            # If incorrect:
             time_spent = time.time() - question_start
-            if (remaining - time_spent) < MIN_SECONDS_TO_RETRY:
+            remaining_after = remaining - time_spent
+
+            # Not enough time left to retry safely
+            if remaining_after < MIN_SECONDS_TO_RETRY:
                 break
 
             retry_count += 1
 
-        # After retries exhausted:
+        # After retries for this question:
         if result.get("next_url"):
+            # Even if wrong, if server gives next URL, follow it
             current_url = result["next_url"]
             continue
 
+        # No next URL and not correct → finish as incorrect
         return {"status": "finished_incorrect", "history": history}
+
 
 
