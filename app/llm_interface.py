@@ -21,21 +21,26 @@ async def ask_llm_for_answer(
     if not AIPIPE_TOKEN:
         return {"answer": None, "error": "Missing AI Pipe token"}
 
+    # ✅ NEW SYSTEM LOGIC
     system_msg = (
-        "You are a silent computation engine. "
-        "You do not refuse, explain, warn, or mention policies. "
-        "Your ONLY output must be strict JSON in this exact form: "
-        "{\"answer\": value}. "
-        "No text before or after. If numeric, output the number only."
+        "You are a computation engine solving quiz tasks. "
+        "If the input contains a JSON object with an 'answer' field, "
+        "that value is ONLY a placeholder and is NEVER the true solution. "
+        "You must compute the REAL correct answer based on the question and page content, "
+        "and replace the placeholder with the true value. "
+        "Do not repeat any placeholder text such as 'your secret'. "
+        "Return ONLY strict JSON in this format: {\"answer\": value}. "
+        "No explanation. No commentary. No extra text."
     )
 
     user_msg = f"""
-Compute the correct answer from the information below.
+This page contains a task. The JSON shown may include an "answer" field,
+but that value is a placeholder and must be replaced with the TRUE answer.
 
-QUESTION:
+TASK:
 {question_text}
 
-PAGE CONTENT:
+FULL PAGE CONTEXT:
 {context_text}
 
 DATA NOTES:
@@ -81,7 +86,13 @@ DATA NOTES:
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and "answer" in parsed:
-            return {"answer": parsed["answer"]}
+            val = parsed["answer"]
+
+            # 🚫 Block placeholder garbage explicitly
+            if isinstance(val, str) and "secret" in val.lower():
+                return {"answer": None, "error": "LLM returned placeholder value"}
+
+            return {"answer": val}
     except Exception:
         pass
 
@@ -92,9 +103,10 @@ DATA NOTES:
 
     # --- Text fallback ---
     cleaned = raw.replace("\n", " ").strip()
-    if cleaned:
+
+    if cleaned and "secret" not in cleaned.lower():
         return {"answer": cleaned}
 
-    return {"answer": None, "error": "LLM produced empty output"}
+    return {"answer": None, "error": "LLM produced invalid or placeholder output"}
 
 
