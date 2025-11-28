@@ -17,37 +17,39 @@ async def ask_llm_for_answer(
     context_text: str = "",
     data_notes: str = "",
 ) -> Dict[str, Any]:
+    """
+    LLM Interface (Computation Engine)
+    Role: Derive the correct answer from provided content.
+    Returns ONLY structured result: {"answer": value}
+    """
 
     if not AIPIPE_TOKEN:
-        return {"answer": None, "error": "Missing AI Pipe token"}
+        return {"answer": None, "error": "Missing AI token"}
 
-    # ✅ NEW SYSTEM LOGIC
-    system_msg = (
-        "You are a computation engine solving quiz tasks. "
-        "If the input contains a JSON object with an 'answer' field, "
-        "that value is ONLY a placeholder and is NEVER the true solution. "
-        "You must compute the REAL correct answer based on the question and page content, "
-        "and replace the placeholder with the true value. "
-        "Do not repeat any placeholder text such as 'your secret'. "
-        "Return ONLY strict JSON in this format: {\"answer\": value}. "
-        "No explanation. No commentary. No extra text."
+    system_prompt = (
+        "You are a deterministic reasoning engine for automated quiz solving. "
+        "You will receive a task and related page content. "
+        "Any JSON object shown inside the content may include an 'answer' field, "
+        "but it is a placeholder and is ALWAYS incorrect. You must ignore it. "
+        "Your job is to compute the true correct answer.\n\n"
+        "Rules:\n"
+        "- NEVER repeat any placeholder value\n"
+        "- NEVER output commentary\n"
+        "- NEVER include reasoning\n"
+        "- Output ONLY valid JSON: {\"answer\": value}\n"
+        "- If no valid answer can be computed, respond: {\"answer\": null}"
     )
 
-    user_msg = f"""
-This page contains a task. The JSON shown may include an "answer" field,
-but that value is a placeholder and must be replaced with the TRUE answer.
-
+    user_prompt = f"""
 TASK:
 {question_text}
 
-FULL PAGE CONTEXT:
+PAGE CONTEXT:
 {context_text}
 
 DATA NOTES:
 {data_notes}
 """
-
-    url = f"{AIPIPE_BASE_URL}/chat/completions"
 
     headers = {
         "Authorization": f"Bearer {AIPIPE_TOKEN}",
@@ -56,57 +58,52 @@ DATA NOTES:
 
     payload = {
         "model": AIPIPE_MODEL,
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
         "temperature": 0.0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response = requests.post(
+            f"{AIPIPE_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
         response.raise_for_status()
-        data = response.json()
+        result = response.json()
     except Exception as e:
-        return {
-            "answer": None,
-            "error": f"AI Pipe connection failure: {str(e)}"
-        }
+        return {"answer": None, "error": f"LLM request failed: {str(e)}"}
 
     try:
-        raw = data["choices"][0]["message"]["content"].strip()
+        raw_content = result["choices"][0]["message"]["content"].strip()
     except Exception:
-        return {
-            "answer": None,
-            "error": "Malformed AI Pipe response",
-            "raw": data
-        }
+        return {"answer": None, "error": "Malformed LLM response", "raw": result}
 
-    # --- Strict JSON Extraction ---
+    # --- STRICT JSON PARSING ---
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw_content)
         if isinstance(parsed, dict) and "answer" in parsed:
             val = parsed["answer"]
 
-            # 🚫 Block placeholder garbage explicitly
-            if isinstance(val, str) and "secret" in val.lower():
-                return {"answer": None, "error": "LLM returned placeholder value"}
+            # Hard safety guard: reject placeholder artefacts
+            if isinstance(val, str) and any(x in val.lower() for x in ["secret", "placeholder", "example"]):
+                return {"answer": None, "error": "Rejected placeholder output"}
 
             return {"answer": val}
     except Exception:
         pass
 
-    # --- Numeric fallback ---
-    match = re.search(r"-?\d+(?:\.\d+)?", raw)
-    if match:
-        return {"answer": float(match.group())}
+    # --- Controlled numeric fallback ---
+    number_match = re.fullmatch(r"-?\d+(?:\.\d+)?", raw_content)
+    if number_match:
+        return {"answer": float(raw_content)}
 
-    # --- Text fallback ---
-    cleaned = raw.replace("\n", " ").strip()
-
-    if cleaned and "secret" not in cleaned.lower():
+    # --- Final defensive fallback ---
+    cleaned = raw_content.replace("\n", " ").strip()
+    if cleaned:
         return {"answer": cleaned}
 
-    return {"answer": None, "error": "LLM produced invalid or placeholder output"}
-
-
+    return {"answer": None, "error": "Unusable LLM output"}
