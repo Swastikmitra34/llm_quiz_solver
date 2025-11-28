@@ -4,9 +4,10 @@ from typing import Tuple
 
 async def fetch_page_html_and_text(url: str) -> Tuple[str, str]:
     """
-    Returns (html_content, visible_text)
-    Cloud-safe Playwright configuration for Render.
+    Returns (html_content, visible_question_text)
+    Robust Playwright extraction for IITM quiz pages (base64 + JS rendered).
     """
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -19,13 +20,21 @@ async def fetch_page_html_and_text(url: str) -> Tuple[str, str]:
         )
 
         page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=60000)
 
-        # Allow JS to finish rendering dynamic content
-        await page.wait_for_timeout(2000)
+        # Load and allow JS execution
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
+
+        # Ensure dynamic content appears
+        try:
+            await page.wait_for_selector("#result", timeout=10000)
+            visible_text = await page.inner_text("#result")
+        except Exception:
+            # Fallback: extract full body if #result is missing
+            visible_text = await page.inner_text("body")
 
         html = await page.content()
-        text = await page.inner_text("body")
-
         await browser.close()
-        return html, text
+
+        return html, visible_text
+
