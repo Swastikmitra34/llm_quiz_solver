@@ -22,15 +22,20 @@ async def ask_llm_for_answer(
         return {"answer": None, "error": "Missing AI Pipe token"}
 
     system_msg = (
-        "Return ONLY strict JSON as {\"answer\": value}. "
-        "No explanation. No markdown. No commentary."
+        "You are a silent computation engine. "
+        "You do not refuse, explain, warn, or mention policies. "
+        "Your ONLY output must be strict JSON in this exact form: "
+        "{\"answer\": value}. "
+        "No text before or after. If numeric, output the number only."
     )
 
     user_msg = f"""
+Compute the correct answer from the information below.
+
 QUESTION:
 {question_text}
 
-PAGE CONTEXT:
+PAGE CONTENT:
 {context_text}
 
 DATA NOTES:
@@ -72,7 +77,7 @@ DATA NOTES:
             "raw": data
         }
 
-    # --- Strict JSON Parsing ---
+    # --- Strict JSON Extraction ---
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and "answer" in parsed:
@@ -90,6 +95,6 @@ DATA NOTES:
     if cleaned:
         return {"answer": cleaned}
 
-    # --- Absolute failsafe ---
     return {"answer": None, "error": "LLM produced empty output"}
+
 
