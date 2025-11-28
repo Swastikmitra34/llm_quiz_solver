@@ -1,11 +1,9 @@
 import time
 import re
 import json
-import asyncio
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
 
 from .browser import fetch_page_html_and_text
 from .llm_interface import ask_llm_for_answer
@@ -27,12 +25,22 @@ async def solve_quiz(
 ) -> Dict[str, Any]:
     """
     Main orchestration function for solving quiz chain.
+    
+    Args:
+        email: Student email
+        secret: Student secret
+        start_url: Initial quiz URL
+        start_time: Unix timestamp when POST was received
+        timeout_seconds: Maximum time allowed (default 170s, 10s buffer)
+    
+    Returns:
+        Dictionary with completion status and results
     """
     
     visited_urls: List[str] = []
     results: List[Dict[str, Any]] = []
     current_url = start_url
-    max_attempts_per_url = 3
+    max_attempts_per_url = 2
     
     print(f"[SOLVER] Starting quiz chain from: {start_url}")
     
@@ -47,6 +55,7 @@ async def solve_quiz(
                 "elapsed_seconds": elapsed,
             }
         
+        # Prevent infinite loops
         if current_url in visited_urls:
             print(f"[SOLVER] Already visited {current_url}, breaking loop")
             break
@@ -55,6 +64,7 @@ async def solve_quiz(
         print(f"\n[SOLVER] Processing URL: {current_url}")
         print(f"[SOLVER] Time elapsed: {elapsed:.1f}s / {timeout_seconds}s")
         
+        # Attempt to solve current quiz page
         quiz_result = await solve_single_quiz(
             email=email,
             secret=secret,
@@ -65,6 +75,8 @@ async def solve_quiz(
         )
         
         results.append(quiz_result)
+        
+        # Extract next URL from result
         next_url = quiz_result.get("next_url")
         
         if quiz_result.get("status") == "correct":
@@ -78,6 +90,7 @@ async def solve_quiz(
         
         elif quiz_result.get("status") == "incorrect":
             print(f"[SOLVER] ✗ Incorrect answer for {current_url}")
+            # If server provides next URL even on failure, we can skip ahead
             if next_url:
                 print(f"[SOLVER] → Skipping to next URL: {next_url}")
                 current_url = next_url
@@ -86,12 +99,9 @@ async def solve_quiz(
                 break
         
         else:
+            # Error or unknown status
             print(f"[SOLVER] Error processing {current_url}: {quiz_result.get('error')}")
-            if next_url:
-                print(f"[SOLVER] → Attempting next URL despite error: {next_url}")
-                current_url = next_url
-            else:
-                break
+            break
     
     final_elapsed = time.time() - start_time
     return {
@@ -102,129 +112,27 @@ async def solve_quiz(
     }
 
 
-def extract_urls_from_text(text: str, base_url: str) -> List[str]:
-    """Extract all URLs from text, including relative URLs."""
-    urls = []
-    
-    # Match full URLs
-    full_url_pattern = r'https?://[^\s<>"\'()]+(?:[^\s<>"\'().,;!?])'
-    urls.extend(re.findall(full_url_pattern, text))
-    
-    # Match relative URLs with context
-    relative_url_pattern = r'(?:href=|src=|visit|scrape|download|fetch|get|from)[\s"\']*(\/[^\s<>"\'()]+)'
-    relative_matches = re.findall(relative_url_pattern, text, re.IGNORECASE)
-    
-    for rel_url in relative_matches:
-        abs_url = urljoin(base_url, rel_url.strip('"\''))
-        urls.append(abs_url)
-    
-    # Standalone relative URLs
-    standalone_relative = r'(?:^|\s)(\/[a-zA-Z0-9_\-\/\?&=%.]+)'
-    standalone_matches = re.findall(standalone_relative, text, re.MULTILINE)
-    
-    for rel_url in standalone_matches:
-        abs_url = urljoin(base_url, rel_url.strip())
-        urls.append(abs_url)
-    
-    # Deduplicate
-    seen = set()
-    unique_urls = []
-    for url in urls:
-        if url not in seen:
-            seen.add(url)
-            unique_urls.append(url)
-    
-    return unique_urls
-
-
-def find_submit_url_enhanced(html: str, visible_text: str, base_url: str) -> Optional[str]:
-    """Enhanced submit URL detection supporting relative and absolute URLs."""
-    
-    # Pattern 1: Full URLs with /submit
-    pattern1 = r'https?://[^\s<>"\']+/submit[^\s<>"\']*'
-    
-    for text in [html, visible_text]:
-        match = re.search(pattern1, text)
-        if match:
-            url = match.group(0).rstrip('.,;!?)')
-            print(f"[SUBMIT URL] Found full URL: {url}")
-            return url
-    
-    # Pattern 2: Relative URLs with POST/submit keywords
-    pattern2 = r'(?:POST|post|submit|send).*?(?:to|at|endpoint|url)[:\s]+([/][^\s<>"\']+)'
-    
-    for text in [visible_text, html]:
-        match = re.search(pattern2, text, re.IGNORECASE)
-        if match:
-            rel_url = match.group(1).rstrip('.,;!?)')
-            abs_url = urljoin(base_url, rel_url)
-            print(f"[SUBMIT URL] Found relative URL: {rel_url} -> {abs_url}")
-            return abs_url
-    
-    # Pattern 3: Any /submit path
-    pattern3 = r'([/]submit[^\s<>"\']*)'
-    
-    for text in [visible_text, html]:
-        match = re.search(pattern3, text)
-        if match:
-            rel_url = match.group(1).rstrip('.,;!?)')
-            abs_url = urljoin(base_url, rel_url)
-            print(f"[SUBMIT URL] Found /submit path: {rel_url} -> {abs_url}")
-            return abs_url
-    
-    # Pattern 4: Check HTML forms
-    soup = BeautifulSoup(html, 'html.parser')
-    forms = soup.find_all('form')
-    for form in forms:
-        action = form.get('action')
-        if action:
-            abs_url = urljoin(base_url, action)
-            print(f"[SUBMIT URL] Found form action: {action} -> {abs_url}")
-            return abs_url
-    
-    print("[SUBMIT URL] No submit URL found")
-    return None
-
-
-async def scrape_additional_urls(urls: List[str], quiz_url: str) -> str:
-    """Scrape additional URLs mentioned in quiz instructions."""
-    context = ""
-    
-    parsed_quiz = urlparse(quiz_url)
-    additional_urls = [u for u in urls if urlparse(u).path != parsed_quiz.path]
-    
-    if not additional_urls:
-        return context
-    
-    print(f"[SCRAPE] Found {len(additional_urls)} additional URLs to scrape")
-    
-    for url in additional_urls[:5]:
-        try:
-            print(f"[SCRAPE] Fetching: {url}")
-            html, visible_text = await fetch_page_html_and_text(url)
-            
-            if visible_text:
-                context += f"\n\n=== CONTENT FROM {url} ===\n"
-                context += visible_text[:3000]
-                context += "\n=== END CONTENT ===\n"
-                print(f"[SCRAPE] Successfully scraped {len(visible_text)} chars from {url}")
-            
-        except Exception as e:
-            print(f"[SCRAPE] Failed to fetch {url}: {e}")
-            context += f"\n\n=== FAILED TO FETCH {url}: {str(e)} ===\n"
-    
-    return context
-
-
 async def solve_single_quiz(
     email: str,
     secret: str,
     quiz_url: str,
     start_time: float,
     timeout_seconds: int,
-    max_attempts: int = 3,
+    max_attempts: int = 2,
 ) -> Dict[str, Any]:
-    """Solve a single quiz page with comprehensive error handling."""
+    """
+    Solve a single quiz page with retry logic.
+    
+    Returns:
+        {
+            "url": quiz_url,
+            "status": "correct" | "incorrect" | "error",
+            "answer": submitted_answer,
+            "next_url": next_quiz_url or None,
+            "attempts": attempt_count,
+            "reason": failure_reason if any,
+        }
+    """
     
     result = {
         "url": quiz_url,
@@ -238,65 +146,41 @@ async def solve_single_quiz(
     try:
         # Step 1: Fetch page content
         print(f"[QUIZ] Fetching page: {quiz_url}")
-        
-        try:
-            html, visible_text = await fetch_page_html_and_text(quiz_url)
-        except Exception as e:
-            result["error"] = f"Failed to fetch page: {str(e)}"
-            return result
+        html, visible_text = await fetch_page_html_and_text(quiz_url)
         
         if not visible_text:
             result["error"] = "No visible text extracted from page"
             return result
         
         print(f"[QUIZ] Extracted {len(visible_text)} chars of visible text")
-        print(f"[QUIZ] Visible text preview:\n{visible_text[:800]}\n...")
         
         # Step 2: Find submit URL
-        submit_url = find_submit_url_enhanced(html, visible_text, quiz_url)
-        
+        submit_url = find_submit_url_from_text(html)
         if not submit_url:
-            submit_url = find_submit_url_from_text(html)
-            if not submit_url:
-                submit_url = find_submit_url_from_text(visible_text)
+            submit_url = find_submit_url_from_text(visible_text)
         
         if not submit_url:
             result["error"] = "Could not find submit URL in page"
-            print(f"[QUIZ] ❌ Submit URL not found")
-            print(f"[QUIZ] Full visible text:\n{visible_text}")
             return result
         
-        print(f"[QUIZ] ✓ Submit URL: {submit_url}")
+        print(f"[QUIZ] Submit URL: {submit_url}")
         
-        # Step 3: Extract all URLs from page
-        all_urls = extract_urls_from_text(visible_text, quiz_url)
-        print(f"[QUIZ] Found {len(all_urls)} URLs in page: {all_urls}")
-        
-        # Step 4: Scrape additional URLs (for multi-step tasks)
-        scraped_context = ""
-        if all_urls:
-            scraped_context = await scrape_additional_urls(all_urls, quiz_url)
-        
-        # Step 5: Process data sources
+        # Step 3: Detect and process data sources
         data_context = ""
         data_links = find_download_links_from_html(html)
         
-        # Add data URLs from text
-        text_urls = [u for u in all_urls if any(ext in u.lower() for ext in 
-                     ['.csv', '.json', '.xlsx', '.xls', '.pdf', '.txt', '.xml'])]
-        data_links.extend(text_urls)
-        
         if data_links:
             print(f"[QUIZ] Found {len(data_links)} data link(s)")
-            for link in data_links[:3]:
+            for link in data_links[:3]:  # Process max 3 data files
                 full_url = normalize_url(quiz_url, link)
                 print(f"[QUIZ] Downloading: {full_url}")
                 
                 try:
                     meta, df = download_and_load_data(full_url)
                     
+                    # Simple heuristic: if question asks for sum of a column, compute it
                     col_name = extract_column_sum_from_question(visible_text)
-                    if col_name and df is not None and col_name in df.columns:
+                    if col_name and col_name in df.columns:
                         computed_sum = df[col_name].sum()
                         meta += f"\n\n**COMPUTED: sum of '{col_name}' column = {computed_sum}**"
                         print(f"[QUIZ] Computed sum of '{col_name}': {computed_sum}")
@@ -305,14 +189,9 @@ async def solve_single_quiz(
                     
                 except Exception as e:
                     print(f"[QUIZ] Failed to process {full_url}: {e}")
-                    data_context += f"\n\n--- Failed to load {full_url}: {str(e)} ---\n"
+                    data_context += f"\n\n--- Failed to load {full_url}: {e} ---\n"
         
-        # Step 6: Combine all context
-        full_context = data_context
-        if scraped_context:
-            full_context += "\n\n" + scraped_context
-        
-        # Step 7: Attempt submission with retries
+        # Step 4: Attempt submission (with retries)
         for attempt in range(1, max_attempts + 1):
             elapsed = time.time() - start_time
             if elapsed > timeout_seconds:
@@ -323,111 +202,35 @@ async def solve_single_quiz(
             result["attempts"] = attempt
             print(f"\n[QUIZ] Attempt {attempt}/{max_attempts}")
             
-            # Add progressive delay between attempts to avoid rate limits
-            if attempt > 1:
-                delay = 5 * attempt  # 10s, 15s, 20s...
-                print(f"[QUIZ] Waiting {delay}s before retry to avoid rate limits...")
-                await asyncio.sleep(delay)
-            
             # Get answer from LLM
-            try:
-                llm_response = await ask_llm_for_answer(
-                    question_text=visible_text,
-                    context_text=html[:5000],
-                    data_notes=full_context,
-                )
-            except Exception as e:
-                print(f"[QUIZ] LLM invocation error: {e}")
-                result["error"] = f"LLM invocation failed: {str(e)}"
-                
-                # Check if rate limit
-                if "429" in str(e) or "rate limit" in str(e).lower():
-                    if attempt < max_attempts:
-                        print(f"[QUIZ] Rate limit detected, will retry after delay")
-                        continue
-                
-                if attempt < max_attempts:
-                    await asyncio.sleep(3)
-                    continue
-                else:
-                    return result
+            llm_response = await ask_llm_for_answer(
+                question_text=visible_text,
+                context_text=html[:5000],  # Limit HTML context
+                data_notes=data_context,
+            )
             
             if "error" in llm_response:
-                error_msg = str(llm_response['error'])
-                print(f"[QUIZ] LLM error: {error_msg}")
-                
-                # Check for rate limit in error
-                if "429" in error_msg or "rate limit" in error_msg.lower() or "too many" in error_msg.lower():
-                    result["error"] = "Rate limit exceeded after retries"
-                    if attempt < max_attempts:
-                        print(f"[QUIZ] Rate limit detected, will retry with longer delay")
-                        continue
-                    else:
-                        return result
-                
-                result["error"] = error_msg
-                if attempt < max_attempts:
-                    await asyncio.sleep(3)
-                    continue
-                else:
-                    return result
+                print(f"[QUIZ] LLM error: {llm_response['error']}")
+                result["error"] = llm_response["error"]
+                continue
             
             answer = llm_response.get("answer")
-            
-            # Check for nested payload structure
-            if isinstance(answer, dict) and all(k in answer for k in ["email", "secret", "url", "answer"]):
-                print(f"[QUIZ] ⚠️  LLM returned example payload structure")
-                nested_answer = answer.get("answer")
-                
-                if isinstance(nested_answer, str):
-                    lower = nested_answer.lower()
-                    if any(x in lower for x in ["placeholder", "anything", "your", "example", "student"]):
-                        print(f"[QUIZ] Nested answer '{nested_answer}' is a placeholder")
-                        result["error"] = "LLM returned placeholder answer"
-                        if attempt < max_attempts:
-                            continue
-                        else:
-                            return result
-                
-                answer = nested_answer
-                print(f"[QUIZ] Extracted nested answer: {answer}")
-            
-            # Check for placeholder strings
-            if isinstance(answer, str):
-                lower = answer.lower()
-                if any(x in lower for x in ["placeholder", "anything you want", "your answer", 
-                                            "example", "student", "the secret code you scraped"]):
-                    print(f"[QUIZ] Answer '{answer}' is a placeholder")
-                    result["error"] = "LLM returned placeholder answer"
-                    if attempt < max_attempts:
-                        continue
-                    else:
-                        return result
-            
             if answer is None:
                 print("[QUIZ] LLM returned null answer")
                 result["error"] = "LLM could not determine answer"
-                if attempt < max_attempts:
-                    await asyncio.sleep(3)
-                    continue
-                else:
-                    return result
+                continue
             
             print(f"[QUIZ] LLM answer: {answer} (type: {type(answer).__name__})")
             result["answer"] = answer
             
             # Submit answer
-            try:
-                submission_result = submit_answer(
-                    submit_url=submit_url,
-                    email=email,
-                    secret=secret,
-                    quiz_url=quiz_url,
-                    answer=answer,
-                )
-            except Exception as e:
-                print(f"[QUIZ] Submission exception: {e}")
-                submission_result = {"success": False, "error": str(e)}
+            submission_result = submit_answer(
+                submit_url=submit_url,
+                email=email,
+                secret=secret,
+                quiz_url=quiz_url,
+                answer=answer,
+            )
             
             if submission_result.get("success"):
                 is_correct = submission_result.get("correct", False)
@@ -443,21 +246,24 @@ async def solve_single_quiz(
                     return result
                 else:
                     print(f"[QUIZ] ✗ Wrong answer: {reason}")
+                    # If we got a next URL even on wrong answer, we can proceed
                     if next_url:
                         print(f"[QUIZ] Server provided next URL despite wrong answer")
                         return result
+                    # Otherwise retry if attempts remain
                     if attempt < max_attempts:
                         print(f"[QUIZ] Retrying... ({attempt + 1}/{max_attempts})")
                         continue
                     else:
                         return result
             else:
+                # Submission failed (network, server error, etc.)
                 error = submission_result.get("error", "Unknown submission error")
                 print(f"[QUIZ] Submission failed: {error}")
                 result["error"] = error
                 
                 if attempt < max_attempts:
-                    await asyncio.sleep(3)
+                    time.sleep(1)  # Brief pause before retry
                     continue
                 else:
                     return result
@@ -466,8 +272,6 @@ async def solve_single_quiz(
         
     except Exception as e:
         print(f"[QUIZ] Exception in solve_single_quiz: {e}")
-        import traceback
-        traceback.print_exc()
         result["error"] = str(e)
         return result
 
@@ -479,7 +283,18 @@ def submit_answer(
     quiz_url: str,
     answer: Any,
 ) -> Dict[str, Any]:
-    """Submit answer to the quiz endpoint."""
+    """
+    Submit answer to the quiz endpoint.
+    
+    Returns:
+        {
+            "success": bool,
+            "correct": bool (if success),
+            "next_url": str or None (if success),
+            "reason": str or None (if success),
+            "error": str (if not success),
+        }
+    """
     
     payload = {
         "email": email,
@@ -488,17 +303,17 @@ def submit_answer(
         "answer": answer,
     }
     
-    try:
-        payload_json = json.dumps(payload)
-    except (TypeError, ValueError) as e:
-        return {"success": False, "error": f"Failed to serialize payload: {str(e)}"}
-    
+    # Ensure payload is under 1MB
+    payload_json = json.dumps(payload)
     if len(payload_json) > 1_000_000:
-        return {"success": False, "error": f"Payload too large: {len(payload_json)} bytes"}
+        return {
+            "success": False,
+            "error": f"Payload too large: {len(payload_json)} bytes (max 1MB)"
+        }
     
     try:
         print(f"[SUBMIT] POST to {submit_url}")
-        print(f"[SUBMIT] Payload: {payload_json[:300]}")
+        print(f"[SUBMIT] Payload size: {len(payload_json)} bytes")
         
         response = requests.post(
             submit_url,
@@ -515,14 +330,7 @@ def submit_answer(
                 "error": f"HTTP {response.status_code}: {response.text[:200]}"
             }
         
-        try:
-            response_data = response.json()
-        except json.JSONDecodeError as e:
-            return {
-                "success": False,
-                "error": f"Invalid JSON response: {str(e)}"
-            }
-        
+        response_data = response.json()
         print(f"[SUBMIT] Response: {json.dumps(response_data, indent=2)}")
         
         return {
@@ -535,11 +343,11 @@ def submit_answer(
     except requests.exceptions.Timeout:
         return {"success": False, "error": "Request timeout (30s)"}
     
-    except requests.exceptions.ConnectionError as e:
-        return {"success": False, "error": f"Connection error: {str(e)}"}
-    
     except requests.exceptions.RequestException as e:
         return {"success": False, "error": f"Request failed: {str(e)}"}
+    
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON response: {str(e)}"}
     
     except Exception as e:
         return {"success": False, "error": f"Unexpected error: {str(e)}"}
