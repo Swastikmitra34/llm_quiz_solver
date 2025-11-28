@@ -17,7 +17,19 @@ from .utils import (
 
 
 MAX_RETRIES_PER_QUESTION = 2
-MIN_SECONDS_TO_RETRY = 20  # if less than this, skip retry
+MIN_SECONDS_TO_RETRY = 20
+
+
+def extract_answer_from_template(text: str):
+    """
+    Detects explicit instruction blocks that show a JSON payload
+    and extracts the answer directly if present.
+    """
+    match = re.search(r'"answer"\s*:\s*("?[^"\n]+")', text)
+    if match:
+        raw = match.group(1)
+        return raw.strip('"')
+    return None
 
 
 async def solve_single_quiz_attempt(
@@ -28,6 +40,31 @@ async def solve_single_quiz_attempt(
 
     html, text = await fetch_page_html_and_text(quiz_url)
     soup = BeautifulSoup(html, "html.parser")
+
+    # ---------------- TEMPLATE MODE DETECTION ----------------
+    template_answer = extract_answer_from_template(text)
+    submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
+
+    if template_answer and submit_url:
+        payload = {
+            "email": email,
+            "secret": secret,
+            "url": quiz_url,
+            "answer": template_answer,
+        }
+
+        resp = requests.post(submit_url, json=payload, timeout=30)
+        data = resp.json()
+
+        return {
+            "correct": bool(data.get("correct", False)),
+            "next_url": data.get("url"),
+            "reason": data.get("reason"),
+            "used_answer": template_answer,
+            "llm_info": {"mode": "template_followed"},
+        }
+
+    # ---------------- QUESTION EXTRACTION ----------------
 
     possible = []
     for elem in soup.find_all(text=True):
@@ -56,7 +93,8 @@ async def solve_single_quiz_attempt(
     answer_value = None
     llm_info = {}
 
-    # Deterministic numeric processing first
+    # ---------------- NUMERIC HANDLING ----------------
+
     if question_type == "numeric" and dataframes:
         col_name = extract_column_sum_from_question(question_text)
         if col_name:
@@ -64,25 +102,25 @@ async def solve_single_quiz_attempt(
                 df = item["df"]
                 col_map = {c.lower(): c for c in df.columns}
                 if col_name.lower() in col_map:
-                    real_col = col_map[col_name.lower()]
                     try:
-                        s = df[real_col].sum()
+                        s = df[col_map[col_name.lower()]].sum()
                         answer_value = float(s) if hasattr(s, "item") else s
                         llm_info = {"mode": "numeric_auto"}
                         break
                     except:
                         pass
 
-    # LLM fallback as last resort
+    # ---------------- LLM FALLBACK ----------------
+
     if answer_value is None:
         llm_result = await ask_llm_for_answer(
             question_text=question_text,
             context_text=text,
             data_notes=data_context_text,
         )
+
         candidate = llm_result.get("answer")
 
-        # Reject weak hallucinated answers
         if isinstance(candidate, str) and len(candidate.strip()) < 5:
             answer_value = None
         else:
@@ -90,7 +128,6 @@ async def solve_single_quiz_attempt(
 
         llm_info = {"mode": "llm_reasoned", "llm_raw": llm_result}
 
-    # Emergency regex fallback
     if answer_value is None:
         detected = re.search(r"-?\d+(\.\d+)?", question_text)
         answer_value = float(detected.group()) if detected else "unknown"
@@ -112,17 +149,8 @@ async def solve_single_quiz_attempt(
         "answer": answer_value,
     }
 
-    try:
-        resp = requests.post(submit_url, json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        return {
-            "correct": False,
-            "error": str(e),
-            "used_answer": answer_value,
-            "llm_info": llm_info,
-        }
+    resp = requests.post(submit_url, json=payload, timeout=30)
+    data = resp.json()
 
     return {
         "correct": bool(data.get("correct", False)),
@@ -133,14 +161,15 @@ async def solve_single_quiz_attempt(
     }
 
 
+# ✅ FIXED SIGNATURE – matches main.py call
 async def solve_quiz(
     email: str,
     secret: str,
     start_url: str,
+    start_time: float,
     timeout_seconds: float = 170.0,
 ) -> Dict[str, Any]:
 
-    start_time = time.time()
     history = []
     current_url = start_url
 
@@ -176,15 +205,11 @@ async def solve_quiz(
                     break
                 return {"status": "finished_correct", "history": history}
 
-            time_spent = time.time() - question_start
-            time_left_question = remaining - time_spent
-
-            if time_left_question < MIN_SECONDS_TO_RETRY:
+            if (remaining - (time.time() - question_start)) < MIN_SECONDS_TO_RETRY:
                 break
 
             retry_count += 1
 
-        # Move to next URL if provided, otherwise terminate
         if result.get("next_url"):
             current_url = result["next_url"]
             continue
