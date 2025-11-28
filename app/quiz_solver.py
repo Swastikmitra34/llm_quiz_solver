@@ -26,108 +26,108 @@ async def solve_single_quiz(
     html, text = await fetch_page_html_and_text(quiz_url)
     soup = BeautifulSoup(html, "html.parser")
 
-    # ---------------- Extract question ----------------
-    possible = []
-    for elem in soup.find_all(text=True):
-        t = elem.strip()
-        if t and (t.lower().startswith("q") or "question" in t.lower()):
-            possible.append(t)
-
-    question_text = "\n".join(possible) if possible else text.strip()
+    question_text = text.strip()
 
     answer_value = None
     llm_info = {}
 
-    # =========================================================
-    # 1. SCRAPE TASK HANDLER (highest priority)
-    # =========================================================
-    scrape_match = re.search(r"/demo-scrape-data\?[^\\s]+", text)
+    # ======================================================
+    # 1. HARD FIX: SCRAPE DEMO TASK HANDLER
+    # ======================================================
 
-    if scrape_match:
-        scrape_url = normalize_url(quiz_url, scrape_match.group())
+    scrape_url_match = re.search(
+        r"https?://[^\s\"']*demo-scrape-data[^\s\"']*", html
+    )
 
+    if scrape_url_match:
+        scrape_url = scrape_url_match.group()
         try:
-            scrape_resp = requests.get(scrape_url, timeout=30)
+            scrape_resp = requests.get(scrape_url, timeout=20)
             scrape_resp.raise_for_status()
-            scrape_content = scrape_resp.text
+            scrape_html = scrape_resp.text
 
-            # Extract secret code from scraped page
-            code_match = re.search(
-                r"Secret Code[:\s]*([A-Za-z0-9_-]+)",
-                scrape_content,
+            secret_match = re.search(
+                r"Secret\s*Code\s*[:\-]?\s*([A-Za-z0-9_-]+)",
+                scrape_html,
                 re.IGNORECASE
             )
 
-            if code_match:
-                answer_value = code_match.group(1)
+            if secret_match:
+                answer_value = secret_match.group(1)
                 llm_info = {"mode": "scrape_auto"}
-        except:
+
+        except Exception as e:
             answer_value = None
 
-    # =========================================================
-    # 2. DATA + NUMERIC HANDLER
-    # =========================================================
-    if answer_value is None:
+    # ======================================================
+    # 2. LOAD DATA FILES IF PRESENT
+    # ======================================================
 
-        download_links = find_download_links_from_html(html)
-        dataframes = []
-        data_context_parts = []
+    download_links = find_download_links_from_html(html)
+    dataframes = []
+    data_context_parts = []
 
-        for link in download_links:
-            try:
-                full_link = normalize_url(quiz_url, link)
-                meta, df = download_and_load_data(full_link)
-                data_context_parts.append(meta)
-                dataframes.append({"url": full_link, "df": df})
-            except:
-                pass
+    for link in download_links:
+        try:
+            full_link = normalize_url(quiz_url, link)
+            meta, df = download_and_load_data(full_link)
+            data_context_parts.append(meta)
+            dataframes.append({"url": full_link, "df": df})
+        except:
+            pass
 
-        data_context_text = "\n\n".join(data_context_parts)
+    data_context_text = "\n\n".join(data_context_parts)
+
+    # ======================================================
+    # 3. NUMERIC DATA HANDLER
+    # ======================================================
+
+    if answer_value is None and dataframes:
         question_type = classify_question_type(question_text)
-
-        if question_type == "numeric" and dataframes:
+        if question_type == "numeric":
             col_name = extract_column_sum_from_question(question_text)
             if col_name:
                 for item in dataframes:
                     df = item["df"]
                     col_map = {c.lower(): c for c in df.columns}
                     if col_name.lower() in col_map:
-                        try:
-                            real_col = col_map[col_name.lower()]
-                            s = df[real_col].sum()
-                            answer_value = float(s) if hasattr(s, "item") else s
-                            llm_info = {"mode": "numeric_auto"}
-                            break
-                        except:
-                            pass
+                        real_col = col_map[col_name.lower()]
+                        s = df[real_col].sum()
+                        answer_value = float(s)
+                        llm_info = {"mode": "numeric_auto"}
+                        break
 
-    # =========================================================
-    # 3. LLM FALLBACK (only if no solution yet)
-    # =========================================================
+    # ======================================================
+    # 4. LLM FALLBACK (ONLY WHEN NECESSARY)
+    # ======================================================
+
     if answer_value is None:
         llm_result = await ask_llm_for_answer(
             question_text=question_text,
             context_text=text,
-            data_notes=""
+            data_notes=data_context_text,
         )
         answer_value = llm_result.get("answer")
-        llm_info = {"mode": "llm_reasoned", "llm_raw": llm_result}
+        llm_info = {"mode": "llm_fallback", "llm_raw": llm_result}
 
-    # =========================================================
-    # 4. FINAL SAFETY FALLBACK
-    # =========================================================
+    # ======================================================
+    # 5. ABSOLUTE SAFETY NET
+    # ======================================================
+
     if answer_value in [None, "", "unknown"]:
-        detected = re.search(r"-?\d+(\.\d+)?", question_text)
-        answer_value = float(detected.group()) if detected else "ERROR_NO_VALID_ANSWER"
+        match = re.search(r"-?\d+(\.\d+)?", question_text)
+        answer_value = float(match.group()) if match else "unknown"
 
-    # ---------------- Find submit URL ----------------
+    # ======================================================
+    # 6. SUBMIT ANSWER
+    # ======================================================
+
     submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
 
     if submit_url is None:
         return {
             "correct": False,
             "error": "Submit URL not found",
-            "url": None,
             "used_answer": answer_value,
             "llm_info": llm_info,
         }
@@ -147,7 +147,6 @@ async def solve_single_quiz(
         return {
             "correct": False,
             "error": f"Submission failed: {str(e)}",
-            "url": None,
             "used_answer": answer_value,
             "llm_info": llm_info,
         }
@@ -202,8 +201,3 @@ async def solve_quiz(
             return {"status": "finished_correct", "history": history}
 
         return {"status": "finished_incorrect", "history": history}
-
-
-
-
-
