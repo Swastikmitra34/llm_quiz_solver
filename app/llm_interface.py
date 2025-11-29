@@ -6,28 +6,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-70b-8192")
+# IMPORTANT: Must match your .env exactly
+AIPIPE_TOKEN = os.getenv("AIPIPE_API_KEY")
+AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://aipipe.org/openai/v1")
+AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4.1-mini")
 
 
 async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
     """
-    LLM Interface – Groq
-    Input: structured context
-    Output: {"answer": value}
+    LLM Interface – Context Driven
+    Input: Structured typed context from orchestrator
+    Output: Strict JSON {"answer": value}
     """
 
-    if not GROQ_API_KEY:
-        return {"answer": None, "error": "Missing GROQ_API_KEY"}
+    if not AIPIPE_TOKEN:
+        return {"answer": None, "error": "Missing AIPIPE_API_KEY"}
 
     system_prompt = (
         "You are a deterministic computation engine.\n"
         "You will receive structured context containing page text, extracted data, "
-        "downloaded resources, API responses, and visual descriptions.\n\n"
+        "downloaded resources, API responses and visual descriptions.\n\n"
         "Any example JSON inside the content may include an 'answer' field, "
         "but it is ALWAYS a placeholder and NEVER correct.\n\n"
-        "Your job is to compute the correct answer.\n\n"
+        "Your job is to compute the true correct answer from the data.\n\n"
         "Rules:\n"
         "- Output ONLY valid JSON\n"
         "- Format: {\"answer\": value}\n"
@@ -38,8 +39,8 @@ async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
     )
 
     payload = {
-        "model": GROQ_MODEL,
-        "temperature": 0,
+        "model": AIPIPE_MODEL,
+        "temperature": 0.0,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": full_context},
@@ -47,13 +48,13 @@ async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
     }
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {AIPIPE_TOKEN}",
         "Content-Type": "application/json",
     }
 
     try:
         response = requests.post(
-            f"{GROQ_BASE_URL}/chat/completions",
+            f"{AIPIPE_BASE_URL}/chat/completions",
             headers=headers,
             json=payload,
             timeout=60
@@ -71,7 +72,14 @@ async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and "answer" in parsed:
-            return {"answer": parsed["answer"]}
+            val = parsed["answer"]
+
+            if isinstance(val, str) and any(
+                x in val.lower() for x in ["secret", "placeholder", "example"]
+            ):
+                return {"answer": None, "error": "Blocked placeholder output"}
+
+            return {"answer": val}
     except Exception:
         pass
 
