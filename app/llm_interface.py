@@ -1,6 +1,10 @@
+"""
+llm_interface.py
+Fixed version with correct function signature
+"""
+
 import os
 import json
-import re
 from typing import Dict, Any
 import requests
 from dotenv import load_dotenv
@@ -12,15 +16,24 @@ AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://aipipe.org/openai/v1")
 AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4.1-mini")
 
 
-async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
+async def ask_llm_for_answer(
+    question_text: str,
+    context_text: str,
+    data_notes: str = ""
+) -> Dict[str, Any]:
     """
     LLM Interface – Context Driven
-    Input: Structured typed context from orchestrator
+    Input: question_text, context_text, data_notes
     Output: Strict JSON {"answer": value}
     """
 
     if not AIPIPE_TOKEN:
         return {"answer": None, "error": "Missing AI token"}
+
+    # Combine all inputs into full context
+    full_context = f"{question_text}\n\n{context_text}"
+    if data_notes:
+        full_context += f"\n\n{data_notes}"
 
     system_prompt = (
         "You are a deterministic computation engine.\n"
@@ -69,18 +82,30 @@ async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
     except Exception:
         return {"answer": None, "error": "Malformed response"}
 
+    # Remove markdown code blocks if present
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and "answer" in parsed:
             val = parsed["answer"]
 
-            if isinstance(val, str) and any(x in val.lower() for x in ["secret", "placeholder", "example"]):
+            # Block placeholder values
+            if isinstance(val, str) and any(
+                x in val.lower() for x in ["secret", "placeholder", "example"]
+            ):
                 return {"answer": None, "error": "Blocked placeholder output"}
 
-            return {"answer": val}
-    except Exception:
-        pass
+            return {"answer": val, "raw_response": raw}
+    except Exception as e:
+        return {"answer": None, "error": f"JSON parse error: {str(e)}", "raw": raw}
 
-    return {"answer": None, "error": "Non-compliant output"}
-
+    return {"answer": None, "error": "Non-compliant output", "raw": raw}
 
