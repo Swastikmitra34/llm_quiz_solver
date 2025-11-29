@@ -1,226 +1,329 @@
+"""
+utils.py
+Enhanced utilities for handling various question types:
+- Web scraping (with JS support)
+- API calls with headers
+- PDF extraction
+- Image processing
+- Data transformation
+- Visualization generation
+"""
+
 import re
+import base64
 import io
-from typing import Optional, List, Tuple, Any
+from typing import Dict, Any, List, Tuple, Optional
 from urllib.parse import urljoin, urlparse
+
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
+# For PDF handling
+try:
+    import PyPDF2
+    import pdfplumber
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
+# For image handling
+try:
+    from PIL import Image
+    import pytesseract
+    HAS_IMAGE = True
+except ImportError:
+    HAS_IMAGE = False
+
+# For visualization
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    HAS_VIZ = True
+except ImportError:
+    HAS_VIZ = False
+
 
 def normalize_url(base_url: str, link: str) -> str:
-    """Convert relative URL to absolute URL."""
+    """Convert relative URLs to absolute URLs"""
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
     return urljoin(base_url, link)
 
 
 def find_submit_url_from_text(text: str) -> Optional[str]:
-    """
-    Find submit URL in text (legacy function for compatibility).
-    Looks for full URLs containing /submit or submit endpoints.
-    """
-    # Pattern for full URLs with submit
-    pattern = r'https?://[^\s<>"\']+/submit[^\s<>"\']*'
-    match = re.search(pattern, text)
+    """Extract submit URL from page text"""
+    patterns = [
+        r"post.*?to\s+(https?://[^\s\"'<>]+)",
+        r"submit.*?to\s+(https?://[^\s\"'<>]+)",
+        r"POST\s+(https?://[^\s\"'<>]+)",
+    ]
     
-    if match:
-        return match.group(0).rstrip('.,;!?)')
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).rstrip(".,;:")
     
     return None
 
 
 def find_download_links_from_html(html: str) -> List[str]:
-    """
-    Extract downloadable file links from HTML.
-    Looks for links to data files (CSV, JSON, PDF, Excel, etc.).
-    """
-    soup = BeautifulSoup(html, 'html.parser')
+    """Find downloadable file links (CSV, Excel, PDF, JSON, etc.)"""
+    soup = BeautifulSoup(html, "html.parser")
     links = []
     
-    # File extensions that indicate data files
-    data_extensions = [
-        '.csv', '.json', '.xlsx', '.xls', '.pdf', 
-        '.txt', '.xml', '.tsv', '.parquet', '.zip'
-    ]
+    file_extensions = ['.csv', '.xlsx', '.xls', '.json', '.pdf', '.txt', '.parquet']
     
-    # Find all <a> tags with href
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href']
-        
-        # Check if link points to a data file
-        if any(ext in href.lower() for ext in data_extensions):
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if any(href.lower().endswith(ext) for ext in file_extensions):
             links.append(href)
-    
-    # Also check for links in onclick, data attributes, etc.
-    for tag in soup.find_all(attrs={'data-url': True}):
-        url = tag['data-url']
-        if any(ext in url.lower() for ext in data_extensions):
-            links.append(url)
     
     return links
 
 
-def extract_column_sum_from_question(question_text: str) -> Optional[str]:
-    """
-    Heuristic to detect if question asks for sum of a specific column.
-    Returns the column name if found.
+def extract_api_headers_from_text(text: str) -> Dict[str, str]:
+    """Extract API headers mentioned in the page text"""
+    headers = {}
     
-    Examples:
-        "What is the sum of the 'value' column?" -> "value"
-        "Sum the price column" -> "price"
-    """
-    # Pattern 1: sum of the "column_name" column
-    pattern1 = r'sum\s+(?:of\s+)?(?:the\s+)?["\']([^"\']+)["\'](?:\s+column)?'
-    match = re.search(pattern1, question_text, re.IGNORECASE)
-    if match:
-        return match.group(1)
+    # Look for header patterns like: "X-API-Key: abc123" or "Authorization: Bearer token"
+    header_pattern = r"([A-Z][a-zA-Z-]+):\s*([^\n\r]+)"
+    matches = re.findall(header_pattern, text)
     
-    # Pattern 2: sum the column_name column
-    pattern2 = r'sum\s+(?:the\s+)?(\w+)\s+column'
-    match = re.search(pattern2, question_text, re.IGNORECASE)
-    if match:
-        return match.group(1)
+    for key, value in matches:
+        if key.lower() in ['authorization', 'x-api-key', 'api-key', 'token']:
+            headers[key] = value.strip()
     
-    return None
+    return headers
 
 
-def download_and_load_data(url: str, timeout: int = 30) -> Tuple[str, Optional[pd.DataFrame]]:
+def download_and_load_data(url: str, headers: Optional[Dict] = None) -> Tuple[str, pd.DataFrame]:
     """
-    Download a file from URL and attempt to load it as structured data.
-    
-    Args:
-        url: URL to download from
-        timeout: Request timeout in seconds
-    
-    Returns:
-        Tuple of (metadata_string, dataframe_or_none)
+    Download and load data file (CSV, Excel, JSON, etc.)
+    Returns (metadata_string, dataframe)
     """
     try:
-        response = requests.get(url, timeout=timeout)
+        response = requests.get(url, headers=headers or {}, timeout=30)
         response.raise_for_status()
-        content = response.content
         
-        # Detect file type from URL or content-type
-        content_type = response.headers.get('Content-Type', '').lower()
+        # Determine file type
+        content_type = response.headers.get('content-type', '').lower()
         url_lower = url.lower()
         
         # CSV
-        if '.csv' in url_lower or 'text/csv' in content_type:
-            df = pd.read_csv(io.BytesIO(content))
-            meta = f"CSV file with {len(df)} rows and {len(df.columns)} columns\n"
-            meta += f"Columns: {', '.join(df.columns)}\n"
-            meta += f"First few rows:\n{df.head(10).to_string()}\n"
-            meta += f"Summary statistics:\n{df.describe().to_string()}"
+        if 'csv' in content_type or url_lower.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(response.content))
+            meta = f"CSV file: {url}\nShape: {df.shape}\nColumns: {list(df.columns)}"
+            return meta, df
+        
+        # Excel
+        elif 'excel' in content_type or url_lower.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(io.BytesIO(response.content))
+            meta = f"Excel file: {url}\nShape: {df.shape}\nColumns: {list(df.columns)}"
             return meta, df
         
         # JSON
-        elif '.json' in url_lower or 'application/json' in content_type:
-            try:
-                df = pd.read_json(io.BytesIO(content))
-                meta = f"JSON file loaded as dataframe with {len(df)} rows\n"
-                meta += f"Columns: {', '.join(df.columns)}\n"
-                meta += f"First few rows:\n{df.head(10).to_string()}"
-                return meta, df
-            except:
-                # If not tabular JSON, just show the content
-                import json
-                data = json.loads(content)
-                meta = f"JSON data:\n{json.dumps(data, indent=2)[:2000]}"
-                return meta, None
-        
-        # Excel
-        elif any(ext in url_lower for ext in ['.xlsx', '.xls']) or 'spreadsheet' in content_type:
-            df = pd.read_excel(io.BytesIO(content))
-            meta = f"Excel file with {len(df)} rows and {len(df.columns)} columns\n"
-            meta += f"Columns: {', '.join(df.columns)}\n"
-            meta += f"First few rows:\n{df.head(10).to_string()}\n"
-            meta += f"Summary statistics:\n{df.describe().to_string()}"
+        elif 'json' in content_type or url_lower.endswith('.json'):
+            df = pd.read_json(io.BytesIO(response.content))
+            meta = f"JSON file: {url}\nShape: {df.shape}\nColumns: {list(df.columns)}"
             return meta, df
         
-        # PDF
-        elif '.pdf' in url_lower or 'application/pdf' in content_type:
-            try:
-                import PyPDF2
-                pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
-                text = ""
-                for page_num, page in enumerate(pdf_reader.pages[:10], 1):  # First 10 pages
-                    text += f"\n--- Page {page_num} ---\n"
-                    text += page.extract_text()
-                
-                meta = f"PDF with {len(pdf_reader.pages)} pages\n"
-                meta += f"Extracted text (first 10 pages):\n{text[:3000]}"
-                return meta, None
-            except Exception as e:
-                return f"PDF file (could not extract text: {e})", None
+        # Parquet
+        elif url_lower.endswith('.parquet'):
+            df = pd.read_parquet(io.BytesIO(response.content))
+            meta = f"Parquet file: {url}\nShape: {df.shape}\nColumns: {list(df.columns)}"
+            return meta, df
         
-        # Plain text
-        elif '.txt' in url_lower or 'text/plain' in content_type:
-            text = content.decode('utf-8', errors='ignore')
-            meta = f"Text file content:\n{text[:3000]}"
-            return meta, None
-        
-        # Unknown format
+        # Try CSV as default
         else:
-            meta = f"Downloaded {len(content)} bytes (unknown format)\n"
-            meta += f"Content-Type: {content_type}\n"
-            # Try to show as text if possible
-            try:
-                text = content.decode('utf-8', errors='ignore')[:1000]
-                meta += f"Preview:\n{text}"
-            except:
-                meta += "(Binary content)"
-            return meta, None
-    
-    except requests.exceptions.Timeout:
-        return f"Error: Download timeout after {timeout}s", None
-    
-    except requests.exceptions.RequestException as e:
-        return f"Error downloading file: {str(e)}", None
-    
+            df = pd.read_csv(io.BytesIO(response.content))
+            meta = f"Data file: {url}\nShape: {df.shape}\nColumns: {list(df.columns)}"
+            return meta, df
+            
     except Exception as e:
-        return f"Error processing file: {str(e)}", None
+        raise Exception(f"Failed to load data from {url}: {str(e)}")
 
 
-def extract_secret_code_from_text(text: str) -> Optional[str]:
+def extract_text_from_pdf(url: str, headers: Optional[Dict] = None) -> str:
+    """Extract text from PDF file"""
+    if not HAS_PDF:
+        return "PDF libraries not available"
+    
+    try:
+        response = requests.get(url, headers=headers or {}, timeout=30)
+        response.raise_for_status()
+        
+        # Try pdfplumber first (better for tables)
+        try:
+            with pdfplumber.open(io.BytesIO(response.content)) as pdf:
+                text_parts = []
+                for page in pdf.pages:
+                    text_parts.append(f"--- Page {page.page_number} ---")
+                    text_parts.append(page.extract_text() or "")
+                    
+                    # Extract tables if present
+                    tables = page.extract_tables()
+                    if tables:
+                        for table in tables:
+                            df = pd.DataFrame(table[1:], columns=table[0])
+                            text_parts.append("\nTable:")
+                            text_parts.append(df.to_string())
+                
+                return "\n".join(text_parts)
+        except:
+            pass
+        
+        # Fallback to PyPDF2
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(response.content))
+        text_parts = []
+        for i, page in enumerate(pdf_reader.pages):
+            text_parts.append(f"--- Page {i + 1} ---")
+            text_parts.append(page.extract_text())
+        
+        return "\n".join(text_parts)
+        
+    except Exception as e:
+        return f"Failed to extract PDF text: {str(e)}"
+
+
+def process_image(url: str, headers: Optional[Dict] = None) -> Dict[str, Any]:
     """
-    Extract a secret code from text.
-    Looks for patterns like "secret code: ABC123" or similar.
+    Process image: OCR text extraction and basic analysis
+    Returns dict with text, dimensions, format
     """
-    # Pattern 1: "secret code: VALUE" or "secret: VALUE"
-    pattern1 = r'secret\s*(?:code)?[:\s]+([A-Za-z0-9_\-]+)'
-    match = re.search(pattern1, text, re.IGNORECASE)
-    if match:
-        return match.group(1)
+    if not HAS_IMAGE:
+        return {"error": "Image libraries not available"}
     
-    # Pattern 2: "code: VALUE" or "code is VALUE"
-    pattern2 = r'code[:\s]+(?:is\s+)?([A-Za-z0-9_\-]+)'
-    match = re.search(pattern2, text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    # Pattern 3: Look for alphanumeric strings that might be codes
-    # (between 6-50 characters, mix of letters and numbers)
-    pattern3 = r'\b([A-Za-z0-9]{6,50})\b'
-    matches = re.findall(pattern3, text)
-    
-    # Filter to codes that look like actual codes (have both letters and numbers)
-    for candidate in matches:
-        has_letter = re.search(r'[A-Za-z]', candidate)
-        has_number = re.search(r'[0-9]', candidate)
-        if has_letter and has_number:
-            return candidate
-    
-    return None
+    try:
+        response = requests.get(url, headers=headers or {}, timeout=30)
+        response.raise_for_status()
+        
+        image = Image.open(io.BytesIO(response.content))
+        
+        result = {
+            "url": url,
+            "format": image.format,
+            "size": image.size,
+            "mode": image.mode,
+        }
+        
+        # Try OCR if available
+        try:
+            text = pytesseract.image_to_string(image)
+            result["ocr_text"] = text
+        except:
+            result["ocr_text"] = "OCR not available"
+        
+        # Convert to base64 for potential submission
+        buffer = io.BytesIO()
+        image.save(buffer, format=image.format or 'PNG')
+        result["base64"] = base64.b64encode(buffer.getvalue()).decode()
+        
+        return result
+        
+    except Exception as e:
+        return {"error": f"Failed to process image: {str(e)}"}
 
 
-def clean_html(html: str) -> str:
-    """Remove script and style tags from HTML."""
-    soup = BeautifulSoup(html, 'html.parser')
+def create_visualization(data: pd.DataFrame, chart_type: str = "auto") -> str:
+    """
+    Create visualization from dataframe
+    Returns base64 encoded image
+    """
+    if not HAS_VIZ:
+        return None
     
-    # Remove script and style elements
-    for script in soup(['script', 'style']):
-        script.decompose()
-    
-    return str(soup)
+    try:
+        plt.figure(figsize=(10, 6))
+        
+        if chart_type == "auto":
+            # Auto-detect chart type
+            if len(data.columns) == 2:
+                # Two columns: likely x-y plot
+                data.plot(x=data.columns[0], y=data.columns[1], kind='line')
+            elif len(data.columns) == 1:
+                # Single column: histogram
+                data[data.columns[0]].hist(bins=30)
+            else:
+                # Multiple columns: correlation heatmap
+                sns.heatmap(data.corr(), annot=True, cmap='coolwarm')
+        
+        elif chart_type == "line":
+            data.plot(kind='line')
+        elif chart_type == "bar":
+            data.plot(kind='bar')
+        elif chart_type == "scatter":
+            if len(data.columns) >= 2:
+                data.plot(x=data.columns[0], y=data.columns[1], kind='scatter')
+        elif chart_type == "hist":
+            data.hist()
+        elif chart_type == "heatmap":
+            sns.heatmap(data.corr(), annot=True, cmap='coolwarm')
+        
+        plt.tight_layout()
+        
+        # Convert to base64
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format='png', dpi=150, bbox_inches='tight')
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.read()).decode()
+        plt.close()
+        
+        return f"data:image/png;base64,{image_base64}"
+        
+    except Exception as e:
+        print(f"Visualization error: {str(e)}")
+        return None
 
+
+def call_api(url: str, method: str = "GET", headers: Optional[Dict] = None, 
+             params: Optional[Dict] = None, json_data: Optional[Dict] = None) -> Dict[str, Any]:
+    """
+    Make API call with custom headers
+    Returns parsed response
+    """
+    try:
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            headers=headers or {},
+            params=params,
+            json=json_data,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        # Try to parse as JSON
+        try:
+            data = response.json()
+            return {"success": True, "data": data, "text": response.text[:1000]}
+        except:
+            return {"success": True, "text": response.text[:5000]}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def extract_api_urls_from_text(text: str) -> List[Dict[str, Any]]:
+    """Extract API endpoints mentioned in text"""
+    api_info = []
+    
+    # Look for API patterns
+    api_pattern = r"(GET|POST|PUT|DELETE)\s+(https?://[^\s\"'<>]+)"
+    matches = re.findall(api_pattern, text, re.IGNORECASE)
+    
+    for method, url in matches:
+        api_info.append({"method": method.upper(), "url": url})
+    
+    # Also look for plain API URLs
+    url_pattern = r"API.*?(https?://[^\s\"'<>]+)"
+    matches = re.findall(url_pattern, text, re.IGNORECASE)
+    
+    for url in matches:
+        if not any(api["url"] == url for api in api_info):
+            api_info.append({"method": "GET", "url": url})
+    
+    return api_info
 
 
 
