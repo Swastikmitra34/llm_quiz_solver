@@ -1,10 +1,6 @@
-"""
-llm_interface.py
-Simple version without retry logic
-"""
-
 import os
 import json
+import re
 from typing import Dict, Any
 import requests
 from dotenv import load_dotenv
@@ -27,12 +23,20 @@ async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
         return {"answer": None, "error": "Missing AI token"}
 
     system_prompt = (
-    "You are a strict data-analysis engine. "
-    "You receive mixed content (web text, CSV, JSON, PDFs, OCR, images, API responses). "
-    "From this, compute the EXACT final answer. "
-    "Rules: no explanation, no markdown, output only valid JSON {\"answer\": value}. "
-    "Use all provided data. If missing data, return {\"answer\": null}. "
-)
+        "You are a deterministic computation engine.\n"
+        "You will receive structured context containing page text, extracted data, "
+        "downloaded resources, API responses and visual descriptions.\n\n"
+        "Any example JSON inside the content may include an 'answer' field, "
+        "but it is ALWAYS a placeholder and NEVER correct.\n\n"
+        "Your job is to compute the true correct answer from the data.\n\n"
+        "Rules:\n"
+        "- Output ONLY valid JSON\n"
+        "- Format: {\"answer\": value}\n"
+        "- No explanations\n"
+        "- No commentary\n"
+        "- No markdown\n"
+        "- If the answer cannot be determined, output {\"answer\": null}"
+    )
 
     payload = {
         "model": AIPIPE_MODEL,
@@ -65,15 +69,6 @@ async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
     except Exception:
         return {"answer": None, "error": "Malformed response"}
 
-    # Remove markdown if present
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        raw = "\n".join(lines).strip()
-
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and "answer" in parsed:
@@ -83,7 +78,7 @@ async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
                 return {"answer": None, "error": "Blocked placeholder output"}
 
             return {"answer": val}
-    except Exception as e:
-        return {"answer": None, "error": f"JSON parse error: {str(e)}", "raw": raw}
+    except Exception:
+        pass
 
     return {"answer": None, "error": "Non-compliant output"}
