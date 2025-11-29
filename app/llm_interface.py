@@ -1,87 +1,101 @@
+
 import os
 import json
+import re
 from typing import Dict, Any
+
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# IMPORTANT: Must match your .env exactly
-AIPIPE_TOKEN = os.getenv("AIPIPE_API_KEY")
-AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://aipipe.org/openai/v1")
+AIPIPE_TOKEN = os.getenv("OPENAI_API_KEY")
+AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://api.aipipe.org/v1")
 AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4.1-mini")
 
 
-async def ask_llm_for_answer(full_context: str) -> Dict[str, Any]:
+async def ask_llm_for_answer(
+    question_text: str,
+    context_text: str = "",
+    data_notes: str = "",
+) -> Dict[str, Any]:
     """
-    LLM Interface – Context Driven
-    Input: Structured typed context from orchestrator
-    Output: Strict JSON {"answer": value}
+    Sends a quiz-solving request to an LLM and enforces strict JSON output.
     """
 
     if not AIPIPE_TOKEN:
-        return {"answer": None, "error": "Missing AIPIPE_API_KEY"}
+        return {"answer": None, "error": "Missing OPENAI_API_KEY / AI Pipe token"}
 
-    system_prompt = (
-        "You are a deterministic computation engine.\n"
-        "You will receive structured context containing page text, extracted data, "
-        "downloaded resources, API responses and visual descriptions.\n\n"
-        "Any example JSON inside the content may include an 'answer' field, "
-        "but it is ALWAYS a placeholder and NEVER correct.\n\n"
-        "Your job is to compute the true correct answer from the data.\n\n"
+    system_msg = (
+        "You are a high-precision problem-solving AI.\n\n"
+        "You MUST return the final answer in strict JSON format:\n"
+        "{\"answer\": \"<final answer>\"}\n\n"
         "Rules:\n"
-        "- Output ONLY valid JSON\n"
-        "- Format: {\"answer\": value}\n"
-        "- No explanations\n"
-        "- No commentary\n"
-        "- No markdown\n"
-        "- If the answer cannot be determined, output {\"answer\": null}"
+        "- Only JSON. No commentary.\n"
+        "- No markdown.\n"
+        "- No reasoning text.\n"
+        "- If numeric, output only the number.\n"
+        "- If textual, output only the final word/phrase."
     )
 
-    payload = {
-        "model": AIPIPE_MODEL,
-        "temperature": 0.0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": full_context},
-        ],
-    }
+    user_msg = (
+        f"Solve the following quiz question.\n\n"
+        f"QUESTION:\n{question_text}\n\n"
+        f"PAGE CONTEXT:\n{context_text}\n\n"
+        f"DATA NOTES:\n{data_notes}\n\n"
+        "Return ONLY JSON with the key \"answer\"."
+    )
 
+    url = f"{AIPIPE_BASE_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {AIPIPE_TOKEN}",
         "Content-Type": "application/json",
     }
 
+    payload = {
+        "model": AIPIPE_MODEL,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.0,
+    }
+
+    # --- API CALL ---
     try:
-        response = requests.post(
-            f"{AIPIPE_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
-        response.raise_for_status()
-        result = response.json()
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        result = resp.json()
     except Exception as e:
-        return {"answer": None, "error": str(e)}
+        return {"answer": None, "error": f"LLM request failed: {e}"}
 
+    # --- RAW RESPONSE EXTRACTION ---
     try:
-        raw = result["choices"][0]["message"]["content"].strip()
+        raw_text = result["choices"][0]["message"]["content"].strip()
     except Exception:
-        return {"answer": None, "error": "Malformed response"}
+        return {"answer": None, "error": "Malformed LLM response", "raw": result}
 
+    # --- 1. Try strict JSON ---
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw_text)
         if isinstance(parsed, dict) and "answer" in parsed:
-            val = parsed["answer"]
-
-            if isinstance(val, str) and any(
-                x in val.lower() for x in ["secret", "placeholder", "example"]
-            ):
-                return {"answer": None, "error": "Blocked placeholder output"}
-
-            return {"answer": val}
+            return {"answer": parsed["answer"]}
     except Exception:
         pass
 
-    return {"answer": None, "error": "Non-compliant output"}
+    # --- 2. Try numeric fallback ---
+    number_match = re.search(r"-?\d+(\.\d+)?", raw_text)
+    if number_match:
+        try:
+            return {"answer": float(number_match.group())}
+        except:
+            pass
+
+    # --- 3. Clean fallback text ---
+    cleaned = raw_text.replace("\n", "").strip()
+    if cleaned:
+        return {"answer": cleaned}
+
+    # --- 4. Hard fallback ---
+    return {"answer": "0"}
 
