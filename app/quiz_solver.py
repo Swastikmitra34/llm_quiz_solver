@@ -167,19 +167,20 @@ async def solve_single_quiz(
     # Build context for LLM
     context = build_llm_context(question, text, resources)
 
-    # Get answer from LLM
-    llm_result = await ask_llm_for_answer(
-        question_text=question,
-        context_text=context,
-        data_notes="",
-    )
+    # Get answer from LLM (with retries built-in)
+    print(f"Calling LLM for quiz: {quiz_url}")
+    full_context = context  # context already includes question
+    llm_result = await ask_llm_for_answer(full_context, max_retries=3)
 
     if "error" in llm_result and llm_result.get("answer") is None:
+        print(f"LLM error: {llm_result['error']}")
         return {
             "correct": False,
             "error": f"LLM error: {llm_result['error']}",
             "llm_info": llm_result
         }
+    
+    print(f"LLM returned answer: {llm_result.get('answer')}")
 
     answer = normalize_answer_type(llm_result.get("answer"))
 
@@ -196,13 +197,17 @@ async def solve_single_quiz(
         return {"correct": False, "error": "Payload too large (>1MB)"}
 
     # Submit answer
+    print(f"Submitting answer to: {resources['submit_url']}")
     try:
         response = requests.post(resources["submit_url"], json=payload, timeout=30)
         response.raise_for_status()
         data = response.json()
+        print(f"Submission result: correct={data.get('correct')}, next_url={data.get('url')}")
     except requests.exceptions.RequestException as e:
+        print(f"Submission failed: {str(e)}")
         return {"correct": False, "error": f"Submission failed: {str(e)}"}
     except json.JSONDecodeError as e:
+        print(f"Invalid JSON response: {str(e)}")
         return {"correct": False, "error": f"Invalid JSON response: {str(e)}"}
 
     return {
