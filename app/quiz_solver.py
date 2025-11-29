@@ -1,13 +1,4 @@
-"""
-quiz_solver.py
-Enhanced version supporting all question types:
-- Web scraping (JS support via browser)
-- API calls with headers
-- PDF extraction
-- Image processing
-- Data analysis
-- Visualization generation
-"""
+
 
 import time
 import re
