@@ -1,7 +1,5 @@
 """
 quiz_solver.py
-General-purpose version that adapts to ANY quiz type dynamically
-No hardcoding of specific quiz solutions
 """
 
 import time
@@ -22,8 +20,6 @@ from .utils import (
     extract_api_headers_from_text,
     extract_text_from_pdf,
     process_image,
-    transcribe_audio,
-    find_audio_sources,
     normalize_dataframe_to_json,
     parse_github_api_response,
     call_api,
@@ -61,7 +57,7 @@ def extract_visible_question(html: str, fallback_text: str) -> str:
 async def gather_page_resources(quiz_url: str, html: str, text: str, email: str = "") -> Dict[str, Any]:
     """
     GENERAL PURPOSE resource gathering - adapts to ANY content type
-    Automatically detects and processes: images, audio, PDFs, CSVs, APIs, etc.
+    Automatically detects and processes: images, PDFs, CSVs, APIs, etc.
     """
     soup = BeautifulSoup(html, "html.parser")
     
@@ -122,23 +118,6 @@ async def gather_page_resources(quiz_url: str, html: str, text: str, email: str 
             print(f"  ✗ Image processing failed: {e}")
             continue
     
-    # Find and transcribe ALL audio files
-    audio_urls = find_audio_sources(html, quiz_url)
-    audio_data = []
-    
-    for audio_url in audio_urls[:3]:  # Process up to 3 audio files
-        try:
-            print(f"  Processing audio: {audio_url}")
-            audio_info = transcribe_audio(audio_url, api_headers)
-            if audio_info:
-                audio_data.append({
-                    'url': audio_url,
-                    **audio_info
-                })
-        except Exception as e:
-            print(f"  ✗ Audio processing failed: {e}")
-            continue
-    
     # Find and call ALL API endpoints
     api_endpoints = extract_api_urls_from_text(text)
     api_responses = []
@@ -194,7 +173,6 @@ async def gather_page_resources(quiz_url: str, html: str, text: str, email: str 
         "data_context_text": "\n\n".join(data_context),
         "pdf_texts": pdf_texts,
         "image_data": image_data,
-        "audio_data": audio_data,
         "api_responses": api_responses,
         "api_headers": api_headers,
         "other_urls": list(other_urls)[:10],
@@ -265,17 +243,6 @@ def build_llm_context(question_text: str, page_text: str, resources: Dict[str, A
             
             if img.get('ocr_text') and len(img['ocr_text'].strip()) > 0:
                 parts.append(f"OCR Text:\n{img['ocr_text'][:500]}")
-    
-    # Audio transcriptions
-    if resources.get("audio_data"):
-        parts.append("\n=== AUDIO TRANSCRIPTIONS ===")
-        for audio in resources["audio_data"]:
-            parts.append(f"\nAudio: {audio['url']}")
-            parts.append(f"Transcription: {audio.get('transcription', 'N/A')}")
-            if audio.get('method'):
-                parts.append(f"Method: {audio['method']}")
-            if audio.get('duration'):
-                parts.append(f"Duration: {audio['duration']:.2f}s")
     
     # API responses
     if resources.get("api_responses"):
@@ -380,7 +347,6 @@ async def solve_single_quiz(
     print(f"  - Data files: {len(resources['dataframes'])}")
     print(f"  - PDF files: {len(resources.get('pdf_texts', []))}")
     print(f"  - Images: {len(resources.get('image_data', []))}")
-    print(f"  - Audio files: {len(resources.get('audio_data', []))}")
     print(f"  - API calls: {len(resources.get('api_responses', []))}")
     
     if not submit_url:
@@ -495,7 +461,7 @@ async def solve_quiz(
 
         next_url = result.get("url")
 
-        if next_url:
+        if nehttps://github.com/Swastikmitra34/llm_quiz_solver/edit/main/app/quiz_solver.pyxt_url:
             current_url = next_url
             print(f"\n→ Moving to next quiz: {next_url}")
             continue
