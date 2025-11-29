@@ -1,6 +1,5 @@
 """
-utils.py - Enhanced with general-purpose functions
-These functions work for ANY quiz type, not hardcoded for specific quizzes
+utils.py 
 """
 
 import re
@@ -29,14 +28,6 @@ try:
     HAS_IMAGE = True
 except ImportError:
     HAS_IMAGE = False
-
-# For audio handling
-try:
-    import speech_recognition as sr
-    from pydub import AudioSegment
-    HAS_AUDIO = True
-except ImportError:
-    HAS_AUDIO = False
 
 # For visualization
 try:
@@ -264,9 +255,16 @@ def transcribe_audio(url: str, headers: Optional[Dict] = None) -> Dict[str, Any]
     """
     Download and transcribe audio file
     Returns dict with transcription and metadata
+    If audio libraries not available, returns URL for manual transcription
     """
     if not HAS_AUDIO:
-        return {"error": "Audio libraries not available", "transcription": "unable to transcribe audio"}
+        print(f"  ⚠ Audio libraries not installed - skipping transcription")
+        return {
+            "error": "Audio libraries not available (SpeechRecognition/pydub not installed)", 
+            "transcription": "Audio file found but transcription libraries not available",
+            "url": url,
+            "note": "Install with: pip install SpeechRecognition pydub (requires Python < 3.13)"
+        }
     
     try:
         print(f"  Downloading audio from: {url}")
@@ -574,4 +572,3 @@ def find_audio_sources(html: str, base_url: str) -> List[str]:
             audio_urls.append(normalize_url(base_url, href))
     
     return list(set(audio_urls))  # Remove duplicates
-
