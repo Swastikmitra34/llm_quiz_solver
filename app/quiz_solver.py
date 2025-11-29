@@ -461,7 +461,7 @@ async def solve_quiz(
 
         next_url = result.get("url")
 
-        if nehttps://github.com/Swastikmitra34/llm_quiz_solver/edit/main/app/quiz_solver.pyxt_url:
+        if next_url:
             current_url = next_url
             print(f"\n→ Moving to next quiz: {next_url}")
             continue
