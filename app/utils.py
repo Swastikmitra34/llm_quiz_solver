@@ -1,12 +1,6 @@
 """
-utils.py
-Enhanced utilities for handling various question types:
-- Web scraping (with JS support)
-- API calls with headers
-- PDF extraction
-- Image processing
-- Data transformation
-- Visualization generation
+utils.py - Enhanced with general-purpose functions
+These functions work for ANY quiz type, not hardcoded for specific quizzes
 """
 
 import re
@@ -14,6 +8,7 @@ import base64
 import io
 from typing import Dict, Any, List, Tuple, Optional
 from urllib.parse import urljoin, urlparse
+from collections import Counter
 
 import requests
 import pandas as pd
@@ -35,6 +30,14 @@ try:
 except ImportError:
     HAS_IMAGE = False
 
+# For audio handling
+try:
+    import speech_recognition as sr
+    from pydub import AudioSegment
+    HAS_AUDIO = True
+except ImportError:
+    HAS_AUDIO = False
+
 # For visualization
 try:
     import matplotlib.pyplot as plt
@@ -54,7 +57,7 @@ def normalize_url(base_url: str, link: str) -> str:
 def find_submit_url_from_text(text: str) -> Optional[str]:
     """Extract submit URL from page text"""
     patterns = [
-        r"post.*?to\s+(https?://[^\s\"'<>]+)",
+        r"post.*?to\s+(https?://[^\s\"'<>]+/submit[^\s\"'<>]*)",
         r"submit.*?to\s+(https?://[^\s\"'<>]+)",
         r"POST\s+(https?://[^\s\"'<>]+)",
     ]
@@ -91,7 +94,7 @@ def extract_api_headers_from_text(text: str) -> Dict[str, str]:
     matches = re.findall(header_pattern, text)
     
     for key, value in matches:
-        if key.lower() in ['authorization', 'x-api-key', 'api-key', 'token']:
+        if key.lower() in ['authorization', 'x-api-key', 'api-key', 'token', 'accept']:
             headers[key] = value.strip()
     
     return headers
@@ -188,8 +191,8 @@ def extract_text_from_pdf(url: str, headers: Optional[Dict] = None) -> str:
 
 def process_image(url: str, headers: Optional[Dict] = None) -> Dict[str, Any]:
     """
-    Process image: OCR text extraction and basic analysis
-    Returns dict with text, dimensions, format
+    Process image: OCR text extraction, dominant color, and basic analysis
+    Returns dict with text, dimensions, format, and color
     """
     if not HAS_IMAGE:
         return {"error": "Image libraries not available"}
@@ -214,6 +217,38 @@ def process_image(url: str, headers: Optional[Dict] = None) -> Dict[str, Any]:
         except:
             result["ocr_text"] = "OCR not available"
         
+        # Extract dominant color (GENERAL PURPOSE)
+        try:
+            # Convert to RGB if needed
+            if image.mode != 'RGB':
+                rgb_image = image.convert('RGB')
+            else:
+                rgb_image = image
+            
+            # Resize for faster processing
+            rgb_image.thumbnail((200, 200))
+            pixels = list(rgb_image.getdata())
+            
+            # Count color frequencies
+            color_counter = Counter(pixels)
+            dominant_color = color_counter.most_common(1)[0][0]
+            
+            # Convert to hex
+            result["dominant_color"] = '#{:02x}{:02x}{:02x}'.format(
+                dominant_color[0], dominant_color[1], dominant_color[2]
+            ).lower()
+            
+            # Also get top 5 colors for more options
+            top_colors = []
+            for color, count in color_counter.most_common(5):
+                hex_color = '#{:02x}{:02x}{:02x}'.format(color[0], color[1], color[2]).lower()
+                top_colors.append({"color": hex_color, "count": count})
+            result["top_colors"] = top_colors
+            
+        except Exception as e:
+            result["dominant_color"] = "#000000"
+            result["color_error"] = str(e)
+        
         # Convert to base64 for potential submission
         buffer = io.BytesIO()
         image.save(buffer, format=image.format or 'PNG')
@@ -223,6 +258,197 @@ def process_image(url: str, headers: Optional[Dict] = None) -> Dict[str, Any]:
         
     except Exception as e:
         return {"error": f"Failed to process image: {str(e)}"}
+
+
+def transcribe_audio(url: str, headers: Optional[Dict] = None) -> Dict[str, Any]:
+    """
+    Download and transcribe audio file
+    Returns dict with transcription and metadata
+    """
+    if not HAS_AUDIO:
+        return {"error": "Audio libraries not available", "transcription": "unable to transcribe audio"}
+    
+    try:
+        print(f"  Downloading audio from: {url}")
+        resp = requests.get(url, headers=headers or {}, timeout=30)
+        resp.raise_for_status()
+        
+        # Determine audio format from URL
+        audio_format = 'mp3'
+        if url.lower().endswith('.wav'):
+            audio_format = 'wav'
+        elif url.lower().endswith('.ogg'):
+            audio_format = 'ogg'
+        elif url.lower().endswith('.m4a'):
+            audio_format = 'm4a'
+        
+        print(f"  Audio format: {audio_format}")
+        
+        # Load audio with pydub
+        audio = AudioSegment.from_file(io.BytesIO(resp.content), format=audio_format)
+        
+        # Convert to WAV for speech recognition
+        wav_io = io.BytesIO()
+        audio.export(wav_io, format='wav')
+        wav_io.seek(0)
+        
+        # Initialize speech recognizer
+        recognizer = sr.Recognizer()
+        
+        with sr.AudioFile(wav_io) as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            audio_data = recognizer.record(source)
+        
+        print(f"  Transcribing audio...")
+        
+        # Try multiple recognition methods
+        transcription = None
+        method_used = None
+        
+        # Try Google Speech Recognition (free, no API key)
+        try:
+            transcription = recognizer.recognize_google(audio_data)
+            method_used = "google"
+            print(f"  ✓ Transcribed (Google): {transcription}")
+        except sr.UnknownValueError:
+            print(f"  ✗ Google could not understand audio")
+        except sr.RequestError as e:
+            print(f"  ✗ Google service error: {e}")
+        
+        # Fallback to Sphinx (offline)
+        if not transcription:
+            try:
+                transcription = recognizer.recognize_sphinx(audio_data)
+                method_used = "sphinx"
+                print(f"  ✓ Transcribed (Sphinx): {transcription}")
+            except:
+                print(f"  ✗ Sphinx failed")
+        
+        if transcription:
+            return {
+                "transcription": transcription.strip(),
+                "method": method_used,
+                "duration": len(audio) / 1000.0,  # in seconds
+                "format": audio_format
+            }
+        else:
+            return {
+                "transcription": "unable to transcribe audio",
+                "error": "All recognition methods failed"
+            }
+                
+    except Exception as e:
+        print(f"  ✗ Audio transcription error: {e}")
+        return {"transcription": "unable to transcribe audio", "error": str(e)}
+
+
+def normalize_dataframe_to_json(df: pd.DataFrame) -> list:
+    """
+    Normalize DataFrame to clean JSON format (GENERAL PURPOSE)
+    Handles common data cleaning tasks automatically
+    """
+    try:
+        df = df.copy()
+        
+        # 1. Strip whitespace from all string columns
+        for col in df.select_dtypes(include=['object']).columns:
+            if hasattr(df[col], 'str'):
+                df[col] = df[col].str.strip()
+        
+        # 2. Standardize date columns (YYYY-MM-DD)
+        date_keywords = ['date', 'joined', 'created', 'updated', 'time', 'timestamp']
+        for col in df.columns:
+            if any(keyword in col.lower() for keyword in date_keywords):
+                try:
+                    df[col] = pd.to_datetime(df[col]).dt.strftime('%Y-%m-%d')
+                except:
+                    pass
+        
+        # 3. Auto-sort by logical columns (id first, then name, then dates)
+        sort_cols = []
+        if 'id' in df.columns:
+            sort_cols.append('id')
+        
+        name_cols = [col for col in df.columns if 'name' in col.lower()]
+        if name_cols:
+            sort_cols.append(name_cols[0])
+        
+        date_cols = [col for col in df.columns if any(kw in col.lower() for kw in date_keywords)]
+        if date_cols:
+            sort_cols.append(date_cols[0])
+        
+        if sort_cols:
+            df = df.sort_values(sort_cols)
+        
+        # 4. Reset index
+        df = df.reset_index(drop=True)
+        
+        # 5. Convert to list of dicts
+        result = df.to_dict('records')
+        
+        # 6. Clean up types (no numpy types, handle NaN/None)
+        for record in result:
+            for key, value in list(record.items()):
+                # Convert numpy types
+                if hasattr(value, 'item'):
+                    record[key] = value.item()
+                # Handle NaN
+                elif pd.isna(value):
+                    record[key] = None
+                # Convert float to int if it's a whole number
+                elif isinstance(value, float) and value.is_integer():
+                    record[key] = int(value)
+        
+        return result
+        
+    except Exception as e:
+        print(f"  ✗ DataFrame normalization error: {e}")
+        return []
+
+
+def parse_github_api_response(data: Dict[str, Any], filter_prefix: str = "", 
+                               filter_extension: str = "") -> Dict[str, Any]:
+    """
+    Parse GitHub API tree response (GENERAL PURPOSE)
+    Filters files by prefix and extension if provided
+    """
+    try:
+        tree_items = data.get('tree', [])
+        
+        files = []
+        dirs = []
+        
+        for item in tree_items:
+            path = item.get('path', '')
+            item_type = item.get('type', '')
+            
+            # Apply filters if provided
+            if filter_prefix and not path.startswith(filter_prefix):
+                continue
+            
+            if filter_extension and not path.endswith(filter_extension):
+                continue
+            
+            if item_type == 'blob':  # File
+                files.append({
+                    'path': path,
+                    'size': item.get('size', 0),
+                    'sha': item.get('sha', '')
+                })
+            elif item_type == 'tree':  # Directory
+                dirs.append(path)
+        
+        return {
+            'total_files': len(files),
+            'total_dirs': len(dirs),
+            'files': files,
+            'directories': dirs,
+            'filter_prefix': filter_prefix,
+            'filter_extension': filter_extension
+        }
+        
+    except Exception as e:
+        return {'error': str(e), 'total_files': 0}
 
 
 def create_visualization(data: pd.DataFrame, chart_type: str = "auto") -> str:
@@ -239,13 +465,10 @@ def create_visualization(data: pd.DataFrame, chart_type: str = "auto") -> str:
         if chart_type == "auto":
             # Auto-detect chart type
             if len(data.columns) == 2:
-                # Two columns: likely x-y plot
                 data.plot(x=data.columns[0], y=data.columns[1], kind='line')
             elif len(data.columns) == 1:
-                # Single column: histogram
                 data[data.columns[0]].hist(bins=30)
             else:
-                # Multiple columns: correlation heatmap
                 sns.heatmap(data.corr(), annot=True, cmap='coolwarm')
         
         elif chart_type == "line":
@@ -326,4 +549,29 @@ def extract_api_urls_from_text(text: str) -> List[Dict[str, Any]]:
     return api_info
 
 
+def find_audio_sources(html: str, base_url: str) -> List[str]:
+    """Find all audio sources in HTML"""
+    soup = BeautifulSoup(html, "html.parser")
+    audio_urls = []
+    
+    # Find <audio> tags
+    for audio in soup.find_all('audio'):
+        src = audio.get('src')
+        if src:
+            audio_urls.append(normalize_url(base_url, src))
+    
+    # Find <source> tags inside <audio>
+    for source in soup.find_all('source'):
+        src = source.get('src')
+        if src and source.parent and source.parent.name == 'audio':
+            audio_urls.append(normalize_url(base_url, src))
+    
+    # Find links to audio files
+    audio_extensions = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac']
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if any(href.lower().endswith(ext) for ext in audio_extensions):
+            audio_urls.append(normalize_url(base_url, href))
+    
+    return list(set(audio_urls))  # Remove duplicates
 
