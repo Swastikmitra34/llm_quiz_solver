@@ -1,4 +1,13 @@
-
+"""
+quiz_solver.py
+Enhanced version supporting all question types:
+- Web scraping (JS support via browser)
+- API calls with headers
+- PDF extraction
+- Image processing
+- Data analysis
+- Visualization generation
+"""
 
 import time
 import re
@@ -291,7 +300,7 @@ async def solve_single_quiz(
 
     # Get answer from LLM
     print("Calling LLM...")
-    llm_result = await ask_llm_for_answer(context, max_retries=3)
+    llm_result = await ask_llm_for_answer(context)
 
     if "error" in llm_result and llm_result.get("answer") is None:
         print(f"✗ LLM error: {llm_result['error']}")
