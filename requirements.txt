@@ -17,3 +17,11 @@ scipy>=1.11.0
 networkx>=3.1  # For network analysis
 geopandas>=0.14.0  # For geospatial analysis
 uvicorn
+fastapi
+pydantic
+python-dotenv
+requests
+beautifulsoup4
+pandas
+lxml
+httpx
