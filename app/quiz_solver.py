@@ -1,5 +1,6 @@
 """
 quiz_solver.py
+Enhanced version supporting all question types with submit URL persistence
 """
 
 import time
@@ -20,8 +21,6 @@ from .utils import (
     extract_api_headers_from_text,
     extract_text_from_pdf,
     process_image,
-    normalize_dataframe_to_json,
-    parse_github_api_response,
     call_api,
     extract_api_urls_from_text,
     create_visualization,
@@ -47,18 +46,15 @@ def extract_visible_question(html: str, fallback_text: str) -> str:
         t = elem.get_text().strip()
         if not t or len(t) < 10:
             continue
-        if any(indicator in t.lower() for indicator in ['question', 'q.', 'what', 'how', 'calculate', 'find', 'download', 'transcribe', 'color', 'count']):
+        if any(indicator in t.lower() for indicator in ['question', 'q.', 'what', 'how', 'calculate', 'find', 'download']):
             candidates.append(t)
 
     raw = "\n".join(candidates[:5]) if candidates else fallback_text
     return sanitize_question_text(raw)
 
 
-async def gather_page_resources(quiz_url: str, html: str, text: str, email: str = "") -> Dict[str, Any]:
-    """
-    GENERAL PURPOSE resource gathering - adapts to ANY content type
-    Automatically detects and processes: images, PDFs, CSVs, APIs, etc.
-    """
+async def gather_page_resources(quiz_url: str, html: str, text: str) -> Dict[str, Any]:
+    """Enhanced resource gathering with all data types"""
     soup = BeautifulSoup(html, "html.parser")
     
     # Submit URL
@@ -67,7 +63,7 @@ async def gather_page_resources(quiz_url: str, html: str, text: str, email: str 
     # API headers if specified
     api_headers = extract_api_headers_from_text(text)
     
-    # Download and process data files
+    # Download data files
     download_links = find_download_links_from_html(html)
     dataframes = []
     data_context = []
@@ -83,84 +79,47 @@ async def gather_page_resources(quiz_url: str, html: str, text: str, email: str 
                 continue
             
             meta, df = download_and_load_data(full_url, api_headers)
-            
-            # Store both raw and normalized versions
-            dataframes.append({
-                "url": full_url, 
-                "df": df,
-                "normalized_json": normalize_dataframe_to_json(df)
-            })
+            dataframes.append({"url": full_url, "df": df})
             data_context.append(meta)
             
         except Exception as e:
             data_context.append(f"Failed to load {link}: {str(e)}")
             continue
     
-    # Find and process ALL images (with OCR and color analysis)
+    # Find images
     images = []
     for img in soup.find_all('img', src=True):
         img_url = normalize_url(quiz_url, img['src'])
         if img_url.startswith('http'):
             images.append(img_url)
     
+    # Process images
     image_data = []
-    for img_url in images[:5]:  # Process up to 5 images
+    for img_url in images[:3]:
         try:
             img_info = process_image(img_url, api_headers)
             if 'error' not in img_info:
                 image_data.append(img_info)
-                print(f"  ✓ Processed image: {img_url}")
-                if img_info.get('dominant_color'):
-                    print(f"    Dominant color: {img_info['dominant_color']}")
-                if img_info.get('ocr_text') and len(img_info['ocr_text'].strip()) > 0:
-                    print(f"    OCR text found: {len(img_info['ocr_text'])} chars")
-        except Exception as e:
-            print(f"  ✗ Image processing failed: {e}")
+        except:
             continue
     
-    # Find and call ALL API endpoints
+    # Find API endpoints
     api_endpoints = extract_api_urls_from_text(text)
     api_responses = []
     
-    for api in api_endpoints[:5]:  # Process up to 5 APIs
+    for api in api_endpoints[:3]:
         try:
-            print(f"  Calling API: {api['method']} {api['url']}")
             result = call_api(api['url'], api['method'], api_headers)
-            
             if result.get('success'):
-                response_data = result.get('data') or result.get('text', '')
-                
-                # If it's GitHub API, parse it
-                if 'api.github.com' in api['url'] and isinstance(response_data, dict):
-                    if 'tree' in response_data:
-                        # Parse GitHub tree with any filters mentioned in text
-                        prefix_match = re.search(r'prefix[:\s=]+["\']?([^"\'>\s]+)["\']?', text, re.IGNORECASE)
-                        ext_match = re.search(r'extension[:\s=]+["\']?([^"\'>\s]+)["\']?', text, re.IGNORECASE)
-                        
-                        parsed = parse_github_api_response(
-                            response_data,
-                            filter_prefix=prefix_match.group(1) if prefix_match else "",
-                            filter_extension=ext_match.group(1) if ext_match else ""
-                        )
-                        
-                        # Add email-based calculation if email provided
-                        if email and parsed.get('total_files') is not None:
-                            parsed['calculated_count'] = parsed['total_files'] + (len(email) % 2)
-                            print(f"    GitHub files: {parsed['total_files']}, Email mod: {len(email) % 2}, Total: {parsed['calculated_count']}")
-                        
-                        response_data = parsed
-                
                 api_responses.append({
                     'url': api['url'],
                     'method': api['method'],
-                    'response': response_data
+                    'response': result.get('data') or result.get('text', '')[:1000]
                 })
-                print(f"  ✓ API call successful")
-        except Exception as e:
-            print(f"  ✗ API call failed: {e}")
+        except:
             continue
     
-    # Collect all URLs for reference
+    # Collect all URLs
     all_urls = set(re.findall(r"https?://[^\s\"'<>]+", text))
     for a in soup.find_all("a", href=True):
         all_urls.add(normalize_url(quiz_url, a["href"]))
@@ -179,10 +138,8 @@ async def gather_page_resources(quiz_url: str, html: str, text: str, email: str 
     }
 
 
-def build_llm_context(question_text: str, page_text: str, resources: Dict[str, Any], email: str = "") -> str:
-    """
-    Build comprehensive context - DYNAMICALLY includes whatever data was found
-    """
+def build_llm_context(question_text: str, page_text: str, resources: Dict[str, Any]) -> str:
+    """Build comprehensive context including all resource types"""
     parts = [
         "=== QUESTION ===",
         question_text,
@@ -190,14 +147,6 @@ def build_llm_context(question_text: str, page_text: str, resources: Dict[str, A
         sanitize_question_text(page_text)[:2000],
     ]
     
-    # Add user email if provided (for personalized calculations)
-    if email:
-        parts.append(f"\n=== USER INFO ===")
-        parts.append(f"Email: {email}")
-        parts.append(f"Email length: {len(email)}")
-        parts.append(f"Email length mod 2: {len(email) % 2}")
-    
-    # Data files with normalized JSON
     if resources["dataframes"]:
         parts.append("\n=== DATA FILES ===")
         for item in resources["dataframes"]:
@@ -209,77 +158,38 @@ def build_llm_context(question_text: str, page_text: str, resources: Dict[str, A
                 f"\nFirst 10 rows:\n{df.head(10).to_string()}",
             ])
             
-            # Add normalized JSON version
-            if item.get("normalized_json"):
-                parts.append(f"\nNormalized JSON format:")
-                parts.append(json.dumps(item["normalized_json"][:5], indent=2))  # Show first 5 records
-                if len(item["normalized_json"]) > 5:
-                    parts.append(f"... ({len(item['normalized_json'])} total records)")
-            
-            # Add statistics for numeric columns
             numeric_cols = df.select_dtypes(include=['number']).columns
             if len(numeric_cols) > 0:
-                parts.append(f"\nNumeric statistics:\n{df[numeric_cols].describe().to_string()}")
+                parts.append(f"\nNumeric column statistics:\n{df[numeric_cols].describe().to_string()}")
     
-    # PDF content
     if resources.get("pdf_texts"):
         parts.append("\n=== PDF CONTENT ===")
         parts.extend(resources["pdf_texts"])
     
-    # Images with OCR and color info
     if resources.get("image_data"):
         parts.append("\n=== IMAGES ===")
         for img in resources["image_data"]:
             parts.append(f"\nImage: {img.get('url')}")
             parts.append(f"Size: {img.get('size')}, Format: {img.get('format')}")
-            
-            if img.get('dominant_color'):
-                parts.append(f"Dominant Color: {img['dominant_color']}")
-            
-            if img.get('top_colors'):
-                parts.append(f"Top 5 Colors:")
-                for color_info in img['top_colors'][:5]:
-                    parts.append(f"  - {color_info['color']} (count: {color_info['count']})")
-            
-            if img.get('ocr_text') and len(img['ocr_text'].strip()) > 0:
-                parts.append(f"OCR Text:\n{img['ocr_text'][:500]}")
+            if img.get('ocr_text'):
+                parts.append(f"OCR Text: {img['ocr_text'][:500]}")
     
-    # API responses
     if resources.get("api_responses"):
         parts.append("\n=== API RESPONSES ===")
         for api in resources["api_responses"]:
             parts.append(f"\n{api['method']} {api['url']}")
-            
-            # Format response nicely
-            response = api['response']
-            if isinstance(response, dict):
-                # Special handling for GitHub tree data
-                if 'total_files' in response:
-                    parts.append(f"Total files: {response['total_files']}")
-                    if 'calculated_count' in response:
-                        parts.append(f"Calculated count (with formula): {response['calculated_count']}")
-                    if response.get('files'):
-                        parts.append(f"Files found:")
-                        for f in response['files'][:10]:
-                            parts.append(f"  - {f['path']}")
-                else:
-                    parts.append(f"Response:\n{json.dumps(response, indent=2)[:1000]}")
-            else:
-                parts.append(f"Response: {str(response)[:1000]}")
+            parts.append(f"Response: {json.dumps(api['response'], indent=2)[:1000]}")
     
-    # API headers
     if resources.get("api_headers"):
         parts.append(f"\n=== API HEADERS ===")
         parts.append(json.dumps(resources["api_headers"], indent=2))
     
-    # Other URLs
     if resources["other_urls"]:
         parts.append("\n=== OTHER URLS FOUND ===")
         parts.extend(resources["other_urls"][:10])
     
     context = "\n".join(parts)
     
-    # Limit context size
     if len(context) > 15000:
         context = context[:15000] + "\n... [truncated]"
     
@@ -321,7 +231,7 @@ async def solve_single_quiz(
     remaining: float,
     cached_submit_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Solve a single quiz question - GENERAL PURPOSE"""
+    """Solve a single quiz question with submit URL persistence"""
 
     print(f"\n{'='*60}")
     print(f"Solving: {quiz_url}")
@@ -337,8 +247,8 @@ async def solve_single_quiz(
     question = extract_visible_question(html, text)
     print(f"✓ Extracted question: {question[:100]}...")
     
-    print("Gathering resources (auto-detecting content types)...")
-    resources = await gather_page_resources(quiz_url, html, text, email)
+    print("Gathering resources...")
+    resources = await gather_page_resources(quiz_url, html, text)
     
     # Use cached submit URL if current page doesn't have one
     submit_url = resources["submit_url"] or cached_submit_url
@@ -352,7 +262,7 @@ async def solve_single_quiz(
     if not submit_url:
         return {"correct": False, "error": "Submit URL not found"}
 
-    context = build_llm_context(question, text, resources, email)
+    context = build_llm_context(question, text, resources)
     print(f"✓ Built context ({len(context)} chars)")
     
     with open("debug_context.txt", "w", encoding="utf-8") as f:
@@ -364,6 +274,7 @@ async def solve_single_quiz(
 
     if "error" in llm_result and llm_result.get("answer") is None:
         print(f"✗ LLM error: {llm_result['error']}")
+        print(f"✗ You can check debug_context.txt to see what data was collected")
         return {
             "correct": False,
             "error": f"LLM error: {llm_result['error']}",
@@ -408,7 +319,7 @@ async def solve_single_quiz(
         "used_answer": answer,
         "llm_info": llm_result,
         "response_data": data,
-        "submit_url": submit_url,
+        "submit_url": submit_url,  # Return submit URL for caching
     }
 
 
@@ -419,12 +330,12 @@ async def solve_quiz(
     start_time: float,
     timeout_seconds: float = MAX_GLOBAL_SECONDS,
 ) -> Dict[str, Any]:
-    """Main quiz solver loop - GENERAL PURPOSE"""
+    """Main quiz solver loop with submit URL persistence"""
 
     current_url = start_url
     history = []
     quiz_count = 0
-    cached_submit_url = None
+    cached_submit_url = None  # Track submit URL across quizzes
 
     while True:
         elapsed = time.time() - start_time
@@ -443,9 +354,10 @@ async def solve_quiz(
             secret=secret,
             quiz_url=current_url,
             remaining=remaining,
-            cached_submit_url=cached_submit_url,
+            cached_submit_url=cached_submit_url,  # Pass cached submit URL
         )
 
+        # Update cached submit URL if we got a new one
         if result.get("submit_url"):
             cached_submit_url = result["submit_url"]
 
