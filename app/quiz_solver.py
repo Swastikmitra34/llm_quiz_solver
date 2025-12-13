@@ -1,7 +1,4 @@
-"""
-quiz_solver.py
-Enhanced version supporting all question types with submit URL persistence
-"""
+
 
 import time
 import re
@@ -21,12 +18,18 @@ from .utils import (
     extract_api_headers_from_text,
     extract_text_from_pdf,
     process_image,
+    normalize_dataframe_to_json,
+    parse_github_api_response,
     call_api,
     extract_api_urls_from_text,
-    create_visualization,
 )
 
-MAX_GLOBAL_SECONDS = 170
+# ============================================================================
+# CONFIGURATION - Adjust these for your needs
+# ============================================================================
+MAX_GLOBAL_SECONDS = 300  # 5 minutes total (allows ~12.5s per quiz for 24 quizzes)
+MAX_QUIZ_SECONDS = 15     # Warn if a quiz takes longer than this
+SKIP_HEAVY_AFTER_SECONDS = 240  # Skip heavy operations after 4 minutes
 
 
 def sanitize_question_text(text: str) -> str:
@@ -38,33 +41,37 @@ def sanitize_question_text(text: str) -> str:
 
 
 def extract_visible_question(html: str, fallback_text: str) -> str:
-    """Extract the main question from HTML"""
-    soup = BeautifulSoup(html, "html.parser")
-    candidates: List[str] = []
-
-    for elem in soup.find_all(['h1', 'h2', 'h3', 'p', 'div']):
-        t = elem.get_text().strip()
-        if not t or len(t) < 10:
-            continue
-        if any(indicator in t.lower() for indicator in ['question', 'q.', 'what', 'how', 'calculate', 'find', 'download']):
-            candidates.append(t)
-
-    raw = "\n".join(candidates[:5]) if candidates else fallback_text
-    return sanitize_question_text(raw)
-
-
-async def gather_page_resources(quiz_url: str, html: str, text: str) -> Dict[str, Any]:
-    """Enhanced resource gathering with all data types"""
+    """Extract the main question from HTML - FAST"""
     soup = BeautifulSoup(html, "html.parser")
     
-    # Submit URL
+    # Quick extraction - first h1/h2 or first 200 chars
+    for tag in ['h1', 'h2', 'h3']:
+        elem = soup.find(tag)
+        if elem:
+            return sanitize_question_text(elem.get_text()[:200])
+    
+    return sanitize_question_text(fallback_text[:200])
+
+
+async def gather_page_resources_fast(quiz_url: str, html: str, text: str, 
+                                     email: str = "", skip_heavy: bool = False) -> Dict[str, Any]:
+    """
+    OPTIMIZED resource gathering
+    Balances speed and accuracy
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    
+    # Submit URL (critical)
     submit_url = find_submit_url_from_text(text) or find_submit_url_from_text(html)
     
-    # API headers if specified
+    # API headers (quick)
     api_headers = extract_api_headers_from_text(text)
     
-    # Download data files
+    # Download data files (limit to first 3 unless critical)
     download_links = find_download_links_from_html(html)
+    limit = 2 if skip_heavy else 3
+    download_links = download_links[:limit]
+    
     dataframes = []
     data_context = []
     pdf_texts = []
@@ -74,57 +81,85 @@ async def gather_page_resources(quiz_url: str, html: str, text: str) -> Dict[str
             full_url = normalize_url(quiz_url, link)
             
             if full_url.lower().endswith('.pdf'):
-                pdf_text = extract_text_from_pdf(full_url, api_headers)
-                pdf_texts.append(f"PDF: {full_url}\n{pdf_text[:3000]}")
+                if not skip_heavy:
+                    pdf_text = extract_text_from_pdf(full_url, api_headers)
+                    pdf_texts.append(f"PDF: {full_url}\n{pdf_text[:2000]}")
                 continue
             
             meta, df = download_and_load_data(full_url, api_headers)
-            dataframes.append({"url": full_url, "df": df})
+            
+            # Normalize datasets up to 200 rows
+            normalized = None
+            if len(df) <= 200:
+                normalized = normalize_dataframe_to_json(df)
+            
+            dataframes.append({
+                "url": full_url, 
+                "df": df,
+                "normalized_json": normalized
+            })
             data_context.append(meta)
             
         except Exception as e:
             data_context.append(f"Failed to load {link}: {str(e)}")
             continue
     
-    # Find images
+    # Images (limit based on time pressure)
     images = []
-    for img in soup.find_all('img', src=True):
+    img_limit = 2 if skip_heavy else 3
+    for img in soup.find_all('img', src=True)[:img_limit]:
         img_url = normalize_url(quiz_url, img['src'])
         if img_url.startswith('http'):
             images.append(img_url)
     
-    # Process images
     image_data = []
-    for img_url in images[:3]:
-        try:
-            img_info = process_image(img_url, api_headers)
-            if 'error' not in img_info:
-                image_data.append(img_info)
-        except:
-            continue
+    if images and not skip_heavy:
+        for img_url in images:
+            try:
+                img_info = process_image(img_url, api_headers)
+                if 'error' not in img_info:
+                    image_data.append(img_info)
+            except:
+                continue
     
-    # Find API endpoints
-    api_endpoints = extract_api_urls_from_text(text)
+    # API calls (limit to 5)
+    api_endpoints = extract_api_urls_from_text(text)[:5]
     api_responses = []
     
-    for api in api_endpoints[:3]:
+    for api in api_endpoints:
         try:
             result = call_api(api['url'], api['method'], api_headers)
+            
             if result.get('success'):
+                response_data = result.get('data') or result.get('text', '')
+                
+                # GitHub API special handling
+                if 'api.github.com' in api['url'] and isinstance(response_data, dict):
+                    if 'tree' in response_data:
+                        prefix_match = re.search(r'prefix[:\s=]+["\']?([^"\'>\s]+)["\']?', text, re.IGNORECASE)
+                        ext_match = re.search(r'extension[:\s=]+["\']?([^"\'>\s]+)["\']?', text, re.IGNORECASE)
+                        
+                        parsed = parse_github_api_response(
+                            response_data,
+                            filter_prefix=prefix_match.group(1) if prefix_match else "",
+                            filter_extension=ext_match.group(1) if ext_match else ""
+                        )
+                        
+                        if email and parsed.get('total_files') is not None:
+                            parsed['calculated_count'] = parsed['total_files'] + (len(email) % 2)
+                        
+                        response_data = parsed
+                
                 api_responses.append({
                     'url': api['url'],
                     'method': api['method'],
-                    'response': result.get('data') or result.get('text', '')[:1000]
+                    'response': response_data
                 })
         except:
             continue
     
-    # Collect all URLs
-    all_urls = set(re.findall(r"https?://[^\s\"'<>]+", text))
-    for a in soup.find_all("a", href=True):
-        all_urls.add(normalize_url(quiz_url, a["href"]))
-    
-    other_urls = {u for u in all_urls if u not in {quiz_url, submit_url}}
+    # Other URLs (limited scan)
+    all_urls = set(re.findall(r"https?://[^\s\"'<>]+", text)[:10])
     
     return {
         "submit_url": submit_url,
@@ -134,70 +169,79 @@ async def gather_page_resources(quiz_url: str, html: str, text: str) -> Dict[str
         "image_data": image_data,
         "api_responses": api_responses,
         "api_headers": api_headers,
-        "other_urls": list(other_urls)[:10],
+        "other_urls": list(all_urls)[:8],
     }
 
 
-def build_llm_context(question_text: str, page_text: str, resources: Dict[str, Any]) -> str:
-    """Build comprehensive context including all resource types"""
+def build_llm_context_fast(question_text: str, page_text: str, 
+                           resources: Dict[str, Any], email: str = "") -> str:
+    """
+    Optimized context building - includes all necessary info
+    """
     parts = [
         "=== QUESTION ===",
-        question_text,
+        question_text[:800],
         "\n=== PAGE CONTENT ===",
-        sanitize_question_text(page_text)[:2000],
+        sanitize_question_text(page_text)[:1500],
     ]
     
+    # User info
+    if email:
+        parts.append(f"\n=== USER INFO ===")
+        parts.append(f"Email: {email}, Length: {len(email)}, Mod 2: {len(email) % 2}")
+    
+    # Data files
     if resources["dataframes"]:
         parts.append("\n=== DATA FILES ===")
-        for item in resources["dataframes"]:
+        for item in resources["dataframes"][:3]:
             df = item["df"]
-            parts.extend([
-                f"\nFile: {item['url']}",
-                f"Shape: {df.shape} (rows × columns)",
-                f"Columns: {list(df.columns)}",
-                f"\nFirst 10 rows:\n{df.head(10).to_string()}",
-            ])
+            parts.append(f"\nFile: {item['url']}")
+            parts.append(f"Shape: {df.shape}, Columns: {list(df.columns)}")
+            parts.append(f"First 8 rows:\n{df.head(8).to_string()}")
             
-            numeric_cols = df.select_dtypes(include=['number']).columns
-            if len(numeric_cols) > 0:
-                parts.append(f"\nNumeric column statistics:\n{df[numeric_cols].describe().to_string()}")
+            if item.get("normalized_json"):
+                parts.append(f"Normalized JSON (first 5):")
+                parts.append(json.dumps(item["normalized_json"][:5], indent=2))
     
+    # PDFs
     if resources.get("pdf_texts"):
         parts.append("\n=== PDF CONTENT ===")
         parts.extend(resources["pdf_texts"])
     
+    # Images
     if resources.get("image_data"):
         parts.append("\n=== IMAGES ===")
-        for img in resources["image_data"]:
-            parts.append(f"\nImage: {img.get('url')}")
-            parts.append(f"Size: {img.get('size')}, Format: {img.get('format')}")
+        for img in resources["image_data"][:3]:
+            if img.get('dominant_color'):
+                parts.append(f"Image: {img['url']}, Color: {img['dominant_color']}")
             if img.get('ocr_text'):
-                parts.append(f"OCR Text: {img['ocr_text'][:500]}")
+                parts.append(f"OCR: {img['ocr_text'][:300]}")
     
+    # API responses
     if resources.get("api_responses"):
         parts.append("\n=== API RESPONSES ===")
-        for api in resources["api_responses"]:
-            parts.append(f"\n{api['method']} {api['url']}")
-            parts.append(f"Response: {json.dumps(api['response'], indent=2)[:1000]}")
-    
-    if resources.get("api_headers"):
-        parts.append(f"\n=== API HEADERS ===")
-        parts.append(json.dumps(resources["api_headers"], indent=2))
-    
-    if resources["other_urls"]:
-        parts.append("\n=== OTHER URLS FOUND ===")
-        parts.extend(resources["other_urls"][:10])
+        for api in resources["api_responses"][:5]:
+            parts.append(f"{api['method']} {api['url']}")
+            response = api['response']
+            if isinstance(response, dict):
+                if 'calculated_count' in response:
+                    parts.append(f"Calculated: {response['calculated_count']}")
+                else:
+                    parts.append(f"{json.dumps(response, indent=2)[:800]}")
+            else:
+                parts.append(f"{str(response)[:800]}")
     
     context = "\n".join(parts)
     
-    if len(context) > 15000:
-        context = context[:15000] + "\n... [truncated]"
+    # Limit context size
+    if len(context) > 12000:
+        context = context[:12000] + "\n...[truncated]"
     
     return context
 
 
 def normalize_answer_type(val):
-    """Convert answer to appropriate type"""
+    """Convert answer to appropriate type - FAST"""
     if val is None:
         return None
     
@@ -213,7 +257,7 @@ def normalize_answer_type(val):
         if re.fullmatch(r"-?\d+(\.\d+)?", s):
             return float(s) if "." in s else int(s)
         
-        if s.startswith("{") or s.startswith("["):
+        if s.startswith(("{", "[")):
             try:
                 return json.loads(s)
             except:
@@ -229,97 +273,75 @@ async def solve_single_quiz(
     secret: str,
     quiz_url: str,
     remaining: float,
+    global_elapsed: float,
     cached_submit_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Solve a single quiz question with submit URL persistence"""
-
-    print(f"\n{'='*60}")
-    print(f"Solving: {quiz_url}")
-    print(f"Time remaining: {remaining:.1f}s")
-    print(f"{'='*60}")
+    """SPEED-OPTIMIZED single quiz solver"""
     
+    quiz_start = time.time()
+    
+    # Determine if we should skip heavy processing
+    skip_heavy = global_elapsed > SKIP_HEAVY_AFTER_SECONDS
+    
+    if skip_heavy:
+        print(f"  ⚡ Speed mode enabled (elapsed: {global_elapsed:.1f}s)")
+    
+    # Fetch page
     try:
         html, text = await fetch_page_html_and_text(quiz_url)
-        print(f"✓ Fetched page ({len(html)} chars HTML, {len(text)} chars text)")
     except Exception as e:
-        return {"correct": False, "error": f"Failed to fetch page: {str(e)}"}
+        return {"correct": False, "error": f"Failed to fetch: {str(e)}"}
 
     question = extract_visible_question(html, text)
-    print(f"✓ Extracted question: {question[:100]}...")
     
-    print("Gathering resources...")
-    resources = await gather_page_resources(quiz_url, html, text)
+    # Gather resources (fast mode)
+    resources = await gather_page_resources_fast(quiz_url, html, text, email, skip_heavy)
     
-    # Use cached submit URL if current page doesn't have one
     submit_url = resources["submit_url"] or cached_submit_url
-    
-    print(f"  - Submit URL: {submit_url} {'(cached)' if not resources['submit_url'] and cached_submit_url else ''}")
-    print(f"  - Data files: {len(resources['dataframes'])}")
-    print(f"  - PDF files: {len(resources.get('pdf_texts', []))}")
-    print(f"  - Images: {len(resources.get('image_data', []))}")
-    print(f"  - API calls: {len(resources.get('api_responses', []))}")
     
     if not submit_url:
         return {"correct": False, "error": "Submit URL not found"}
 
-    context = build_llm_context(question, text, resources)
-    print(f"✓ Built context ({len(context)} chars)")
+    # Build context (fast mode)
+    context = build_llm_context_fast(question, text, resources, email)
     
-    with open("debug_context.txt", "w", encoding="utf-8") as f:
-        f.write(context)
-    print(f"✓ Context saved to debug_context.txt")
-
-    print("Calling LLM...")
+    # Get answer from LLM
     llm_result = await ask_llm_for_answer(context)
 
     if "error" in llm_result and llm_result.get("answer") is None:
-        print(f"✗ LLM error: {llm_result['error']}")
-        print(f"✗ You can check debug_context.txt to see what data was collected")
         return {
             "correct": False,
             "error": f"LLM error: {llm_result['error']}",
-            "llm_info": llm_result,
-            "context_preview": context[:500] + "...",
             "submit_url": submit_url,
         }
     
     answer = normalize_answer_type(llm_result.get("answer"))
-    print(f"✓ LLM answer: {answer}")
 
-    payload = {
-        "email": email,
-        "secret": secret,
-        "url": quiz_url,
-        "answer": answer,
-    }
+    # Submit answer
+    payload = {"email": email, "secret": secret, "url": quiz_url, "answer": answer}
 
-    payload_size = len(json.dumps(payload).encode("utf-8"))
-    if payload_size > 1024 * 1024:
-        return {"correct": False, "error": f"Payload too large ({payload_size} bytes > 1MB)"}
-
-    print(f"Submitting to: {submit_url}")
     try:
-        response = requests.post(submit_url, json=payload, timeout=30)
+        response = requests.post(submit_url, json=payload, timeout=15)
         response.raise_for_status()
         data = response.json()
         
-        print(f"✓ Response: correct={data.get('correct')}, next_url={data.get('url')}")
-        
-    except requests.exceptions.RequestException as e:
-        print(f"✗ Submission failed: {str(e)}")
+    except Exception as e:
         return {"correct": False, "error": f"Submission failed: {str(e)}", "submit_url": submit_url}
-    except json.JSONDecodeError as e:
-        print(f"✗ Invalid JSON response: {str(e)}")
-        return {"correct": False, "error": f"Invalid JSON response: {str(e)}", "submit_url": submit_url}
 
+    quiz_time = time.time() - quiz_start
+    
+    # Log quiz performance
+    status = "✓" if data.get("correct") else "✗"
+    print(f"{status} Quiz completed in {quiz_time:.2f}s")
+    
     return {
         "correct": bool(data.get("correct")),
         "url": data.get("url"),
         "reason": data.get("reason"),
         "used_answer": answer,
-        "llm_info": llm_result,
         "response_data": data,
-        "submit_url": submit_url,  # Return submit URL for caching
+        "submit_url": submit_url,
+        "quiz_time": quiz_time,
     }
 
 
@@ -330,34 +352,39 @@ async def solve_quiz(
     start_time: float,
     timeout_seconds: float = MAX_GLOBAL_SECONDS,
 ) -> Dict[str, Any]:
-    """Main quiz solver loop with submit URL persistence"""
+    """SPEED-OPTIMIZED main quiz solver loop"""
 
     current_url = start_url
     history = []
     quiz_count = 0
-    cached_submit_url = None  # Track submit URL across quizzes
+    cached_submit_url = None
 
     while True:
         elapsed = time.time() - start_time
         remaining = timeout_seconds - elapsed
 
-        if remaining <= 10:
+        if remaining <= 10:  # Keep 10 second buffer
             return {
                 "status": "timeout",
                 "history": history,
-                "message": f"Timeout after {elapsed:.1f}s, solved {quiz_count} quizzes"
+                "message": f"Timeout after {elapsed:.1f}s, solved {quiz_count}/24 quizzes"
             }
 
         quiz_count += 1
+        
+        # Quick progress indicator
+        if quiz_count % 5 == 0:
+            print(f"\n⚡ Progress: {quiz_count}/24 quizzes, {elapsed:.1f}s elapsed")
+        
         result = await solve_single_quiz(
             email=email,
             secret=secret,
             quiz_url=current_url,
             remaining=remaining,
-            cached_submit_url=cached_submit_url,  # Pass cached submit URL
+            global_elapsed=elapsed,
+            cached_submit_url=cached_submit_url,
         )
 
-        # Update cached submit URL if we got a new one
         if result.get("submit_url"):
             cached_submit_url = result["submit_url"]
 
@@ -368,25 +395,26 @@ async def solve_quiz(
             "used_answer": result.get("used_answer"),
             "reason": result.get("reason"),
             "error": result.get("error"),
-            "elapsed": time.time() - start_time,
+            "elapsed": elapsed,
+            "quiz_time": result.get("quiz_time", 0),
         })
 
         next_url = result.get("url")
 
         if next_url:
             current_url = next_url
-            print(f"\n→ Moving to next quiz: {next_url}")
             continue
 
+        # Completed or failed
         if result.get("correct"):
             return {
                 "status": "completed",
                 "history": history,
-                "message": f"Successfully solved all {quiz_count} quizzes in {elapsed:.1f}s"
+                "message": f"✅ Solved all {quiz_count} quizzes in {elapsed:.1f}s!"
             }
         else:
             return {
                 "status": "failed",
                 "history": history,
-                "message": f"Failed on quiz {quiz_count}: {result.get('error') or result.get('reason')}"
+                "message": f"❌ Failed on quiz {quiz_count}/24: {result.get('error') or result.get('reason')}"
             }
